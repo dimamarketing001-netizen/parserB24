@@ -37,7 +37,6 @@ DB_CONFIG = {
 
 TABLE_NAME = 'b24_leads'
 
-
 # --- ЛОГИКА СКРИПТА ---
 
 def create_leads_table(conn):

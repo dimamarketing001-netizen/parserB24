@@ -8,7 +8,6 @@ from dotenv import load_dotenv
 # --- ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ---
 load_dotenv()
 
-
 # --- Bitrix24 Configuration ---
 webhook = os.getenv('BITRIX_WEBHOOK')
 SPAM_STATUS_IDS = ["JUNK", "SPAM", "10", "9", "8", "7", "6", "5", "4", "3", "2", "1"]
