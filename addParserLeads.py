@@ -40,7 +40,7 @@ UF_CRM_VALUE_EKATERINBURG = 58
 UF_CRM_VALUE_CHELYABINSK  = 60
 
 
-def get_uf_crm_value(region: str) -> int | None:
+def get_uf_crm_value(region: str):
     """
     Возвращает значение кастомного поля UF_CRM_1779024295 в зависимости от региона.
     Екатеринбург / Свердловская обл. -> 58

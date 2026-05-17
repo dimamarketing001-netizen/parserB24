@@ -142,7 +142,7 @@ def create_leads_table(conn):
         cursor.close()
 
 
-def normalize_phone(raw_phone: str) -> str | None:
+def normalize_phone(raw_phone: str):
     """
     Нормализует и валидирует номер телефона.
     Возвращает номер в формате 79999999999 или None, если номер некорректный.
