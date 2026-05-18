@@ -605,7 +605,6 @@ def tilda_webhook():
     logging.info(f"[WEBHOOK]   Итоговый form_region = '{form_region}'")
     logging.info(f"[WEBHOOK]   utm_region = '{utm_region}'")
 
-    # --- Определяем отдел продаж ---
     # --- Логируем что именно пойдет в определение отдела ---
     logging.info(f"[WEBHOOK] === ОПРЕДЕЛЕНИЕ ОТДЕЛА ===")
     logging.info(f"[WEBHOOK]   form_region (из формы): '{form_region}'")
