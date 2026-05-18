@@ -56,14 +56,21 @@ class RossvyazMobile:
 
     def load(self, csv_file):
         with open(csv_file, encoding='utf-8-sig', newline='') as f:
-            reader = csv.DictReader(f, delimiter='\t')
+            sample = f.read(4096)
+            f.seek(0)
+
+            # Определяем разделитель автоматически
+            delimiter = ';' if sample.count(';') > sample.count('\t') else '\t'
+
+            reader = csv.DictReader(f, delimiter=delimiter)
 
             if not reader.fieldnames:
                 raise ValueError(f"Файл {csv_file} пустой или не удалось прочитать заголовки.")
 
-            # Чистим заголовки от BOM и лишних пробелов
+            # Чистим заголовки
             reader.fieldnames = [name.replace('\ufeff', '').strip() for name in reader.fieldnames]
 
+            logging.info(f"[ROSSVYAZ] Используем разделитель: '{delimiter}'")
             logging.info(f"[ROSSVYAZ] Заголовки CSV: {reader.fieldnames}")
 
             required_columns = {'АВС/ DEF', 'От', 'До', 'Регион', 'Оператор'}
@@ -75,7 +82,6 @@ class RossvyazMobile:
                 )
 
             for row in reader:
-                # Чистим ключи и значения строки
                 clean_row = {
                     (k.replace('\ufeff', '').strip() if k else k): (v.strip() if isinstance(v, str) else v)
                     for k, v in row.items()
@@ -92,7 +98,6 @@ class RossvyazMobile:
 
                 self.ranges[code].append((start, end, region, operator))
 
-        # Сортируем диапазоны и отдельно сохраняем starts для bisect
         for code in self.ranges:
             self.ranges[code].sort(key=lambda x: x[0])
             self.starts[code] = [item[0] for item in self.ranges[code]]
