@@ -310,6 +310,22 @@ def get_duplicate_lead_id(phone):
         logging.error(f"[DUPLICATE] Ошибка обработки ответа: {e}")
         return None
 
+def is_tilda_test_request(data: dict) -> bool:
+    """
+    Определяет тестовый запрос от Tilda.
+    Если телефона нет и данных почти нет — считаем это тестом.
+    """
+    raw_phone = extract_phone(data)
+
+    meaningful_values = [
+        str(v).strip() for v in data.values()
+        if v is not None and str(v).strip()
+    ]
+
+    if not raw_phone and len(meaningful_values) <= 2:
+        return True
+
+    return False
 
 def create_lead(
         title: str,
@@ -499,18 +515,26 @@ def tilda_webhook():
 
     logging.info(f"[WEBHOOK] Данные запроса: {data}")
 
+    # Если это тестовый запрос от Tilda — просто отвечаем OK, лид не создаём
+    if is_tilda_test_request(data):
+        logging.info("[WEBHOOK] Обнаружен тестовый запрос от Tilda. Возвращаю OK без создания лида.")
+        return jsonify({
+            "status": "ok",
+            "message": "Tilda webhook test accepted"
+        }), 200
+
     # --- Извлекаем поля ---
 
     # Телефон
-    raw_phone = data.get('Phone') or data.get('phone') or data.get('PHONE') or ''
+    raw_phone = extract_phone(data)
     phone = normalize_phone(raw_phone)
 
     if not phone:
         logging.warning(f"[WEBHOOK] Некорректный номер телефона: {raw_phone}")
         return jsonify({
-            "status": "error",
-            "message": "Некорректный номер телефона"
-        }), 400
+            "status": "ok",
+            "message": "Request accepted, but lead was not created because phone is invalid"
+        }), 200
 
     logging.info(f"[WEBHOOK] Нормализованный телефон: {phone}")
 
