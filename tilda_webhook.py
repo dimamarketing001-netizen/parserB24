@@ -220,6 +220,39 @@ def extract_phone(data: dict):
     logging.warning("[WEBHOOK] Телефон не найден ни в одном поле.")
     return ''
 
+def extract_form_region(data: dict) -> str:
+    """
+    Ищет поле с регионом проживания по разным вариантам названия.
+    Tilda может заменять пробелы на подчеркивания.
+    """
+    possible_keys = [
+        'Укажите регион проживания',
+        'Укажите регион проживания:',
+        'Укажите_регион_проживания',
+        'Укажите_регион_проживания:',
+        'region', 'Region', 'REGION',
+        'Регион', 'регион',
+        'Регион проживания', 'Регион_проживания'
+    ]
+
+    # Сначала по точным ключам
+    for key in possible_keys:
+        value = data.get(key)
+        if value and str(value).strip():
+            logging.info(f"[WEBHOOK] Регион найден по ключу '{key}': {value}")
+            return str(value).strip()
+
+    # Потом по похожим (содержит "регион")
+    for key, value in data.items():
+        key_lower = str(key).lower().replace('_', ' ')
+        if 'регион' in key_lower and 'utm' not in key_lower:
+            if value and str(value).strip():
+                logging.info(f"[WEBHOOK] Регион найден по похожему ключу '{key}': {value}")
+                return str(value).strip()
+
+    logging.info("[WEBHOOK] Регион проживания не найден в форме.")
+    return ''
+
 def determine_department(form_region: str, utm_region: str, phone: str, rossvyaz_finder) -> tuple:
     """
     Определяет отдел продаж по приоритету:
@@ -587,15 +620,16 @@ def tilda_webhook():
     utm_campaign = data.get('utm_campaign') or data.get('UTM_CAMPAIGN') or ''
     utm_content = data.get('utm_content') or data.get('UTM_CONTENT') or ''
     utm_term = data.get('utm_term') or data.get('UTM_TERM') or ''
-    utm_region = data.get('utm_region') or ''
+    # utm_region — проверяем что это не макрос типа {region_name}
+    raw_utm_region = data.get('utm_region') or ''
+    if raw_utm_region.startswith('{') and raw_utm_region.endswith('}'):
+        utm_region = ''  # это макрос, не реальный регион
+        logging.info(f"[WEBHOOK] utm_region содержит макрос '{raw_utm_region}', игнорируем.")
+    else:
+        utm_region = raw_utm_region
 
     # Регион из формы (поле "Укажите регион проживания")
-    form_region = (
-            data.get('Укажите регион проживания') or
-            data.get('Укажите регион проживания:') or
-            data.get('region') or
-            ''
-    )
+    form_region = extract_form_region(data)
 
     # Логируем все варианты поиска региона
     logging.info(f"[WEBHOOK] === ПОИСК РЕГИОНА В ФОРМЕ ===")
