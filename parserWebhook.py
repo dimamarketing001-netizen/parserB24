@@ -55,14 +55,37 @@ class RossvyazMobile:
         self.load(csv_file)
 
     def load(self, csv_file):
-        with open(csv_file, encoding='utf-8') as f:
+        with open(csv_file, encoding='utf-8-sig', newline='') as f:
             reader = csv.DictReader(f, delimiter='\t')
+
+            if not reader.fieldnames:
+                raise ValueError(f"Файл {csv_file} пустой или не удалось прочитать заголовки.")
+
+            # Чистим заголовки от BOM и лишних пробелов
+            reader.fieldnames = [name.replace('\ufeff', '').strip() for name in reader.fieldnames]
+
+            logging.info(f"[ROSSVYAZ] Заголовки CSV: {reader.fieldnames}")
+
+            required_columns = {'АВС/ DEF', 'От', 'До', 'Регион', 'Оператор'}
+            missing_columns = required_columns - set(reader.fieldnames)
+            if missing_columns:
+                raise KeyError(
+                    f"В файле {csv_file} отсутствуют обязательные колонки: {missing_columns}. "
+                    f"Фактические заголовки: {reader.fieldnames}"
+                )
+
             for row in reader:
-                code = row['АВС/ DEF'].strip()
-                start = int(row['От'])
-                end = int(row['До'])
-                region = row['Регион'].strip()
-                operator = row['Оператор'].strip()
+                # Чистим ключи и значения строки
+                clean_row = {
+                    (k.replace('\ufeff', '').strip() if k else k): (v.strip() if isinstance(v, str) else v)
+                    for k, v in row.items()
+                }
+
+                code = clean_row['АВС/ DEF']
+                start = int(clean_row['От'])
+                end = int(clean_row['До'])
+                region = clean_row['Регион']
+                operator = clean_row['Оператор']
 
                 if code not in self.ranges:
                     self.ranges[code] = []
