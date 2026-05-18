@@ -1,9 +1,10 @@
+import csv
+import bisect
 import requests
 import mysql.connector
 import logging
 import re
 import sys
-import time
 from datetime import date, datetime, timedelta
 import fcntl
 import os
@@ -14,8 +15,15 @@ load_dotenv()
 
 # --- НАСТРОЙКИ ---
 
-# Настройка логирования для вывода информации в консоль
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', filename='bb.log', force=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('bb.log'),
+        logging.StreamHandler()
+    ],
+    force=True
+)
 
 # Укажите дату, с которой начинать выгрузку лидов, в формате ГГГГ-ММ-ДД
 START_DATE = "2026-05-10"
@@ -37,13 +45,81 @@ DB_CONFIG = {
 
 TABLE_NAME = 'b24_leads'
 
+
+# --- КЛАСС ДЛЯ ОПРЕДЕЛЕНИЯ РЕГИОНА ПО БАЗЕ РОССВЯЗИ ---
+
+class RossvyazMobile:
+    def __init__(self, csv_file):
+        self.ranges = {}
+        self.starts = {}
+        self.load(csv_file)
+
+    def load(self, csv_file):
+        with open(csv_file, encoding='utf-8') as f:
+            reader = csv.DictReader(f, delimiter='\t')
+            for row in reader:
+                code = row['АВС/ DEF'].strip()
+                start = int(row['От'])
+                end = int(row['До'])
+                region = row['Регион'].strip()
+                operator = row['Оператор'].strip()
+
+                if code not in self.ranges:
+                    self.ranges[code] = []
+
+                self.ranges[code].append((start, end, region, operator))
+
+        # Сортируем диапазоны и отдельно сохраняем starts для bisect
+        for code in self.ranges:
+            self.ranges[code].sort(key=lambda x: x[0])
+            self.starts[code] = [item[0] for item in self.ranges[code]]
+
+        logging.info(f"[ROSSVYAZ] Загружено {sum(len(v) for v in self.ranges.values())} диапазонов из ranges.csv.")
+
+    def normalize(self, phone):
+        if not phone:
+            return None
+        digits = re.sub(r'\D', '', str(phone))
+        if len(digits) == 11 and digits.startswith('8'):
+            digits = '7' + digits[1:]
+        elif len(digits) == 10 and digits.startswith('9'):
+            digits = '7' + digits
+        if len(digits) != 11 or not digits.startswith('7'):
+            return None
+        return digits[1:]  # убираем первую 7, остаётся 10 цифр
+
+    def find(self, phone):
+        phone = self.normalize(phone)
+        if not phone or len(phone) != 10:
+            return None
+
+        code = phone[:3]
+        number_part = int(phone[3:])
+
+        if code not in self.ranges:
+            return None
+
+        idx = bisect.bisect_right(self.starts[code], number_part) - 1
+        if idx < 0:
+            return None
+
+        start, end, region, operator = self.ranges[code][idx]
+
+        if start <= number_part <= end:
+            return {
+                "region": region,
+                "operator": operator
+            }
+
+        return None
+
+
 # --- ЛОГИКА СКРИПТА ---
 
 def create_leads_table(conn):
     """Создает таблицу для лидов и добавляет необходимые колонки, если они не существуют."""
     cursor = conn.cursor()
 
-    # 1. Создаём таблицу если не существует
     create_table_query = f"""
     CREATE TABLE IF NOT EXISTS `{TABLE_NAME}` (
         `webhook_source` VARCHAR(255) NOT NULL,
@@ -77,8 +153,6 @@ def create_leads_table(conn):
         cursor.execute(create_table_query)
         conn.commit()
 
-        # 2. Определяем полный эталонный список колонок и их определений
-        # Формат: 'имя_колонки': ('ОПРЕДЕЛЕНИЕ ТИПА', 'AFTER `колонка`')
         required_columns = {
             'webhook_source': ('VARCHAR(255) NOT NULL', None),
             'lead_id':        ('INT UNSIGNED NOT NULL', None),
@@ -108,12 +182,10 @@ def create_leads_table(conn):
             'last_updated':   ('TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP', None),
         }
 
-        # 3. Получаем список существующих колонок из БД одним запросом
         cursor.execute(f"SHOW COLUMNS FROM `{TABLE_NAME}`;")
         existing_columns = {row[0] for row in cursor.fetchall()}
         logging.info(f"Существующие колонки в таблице: {existing_columns}")
 
-        # 4. Проверяем и добавляем отсутствующие колонки
         for col_name, (col_definition, after_col) in required_columns.items():
             if col_name not in existing_columns:
                 logging.warning(f"Колонка '{col_name}' не найдена в таблице `{TABLE_NAME}`. Добавляю...")
@@ -123,7 +195,6 @@ def create_leads_table(conn):
                 conn.commit()
                 logging.info(f"Колонка '{col_name}' успешно добавлена.")
 
-        # 5. Удаляем устаревшие колонки
         old_phone_columns = ['phone_timezone', 'phone_region_geocoder', 'phone_region_tz']
         for col in old_phone_columns:
             if col in existing_columns:
@@ -161,39 +232,7 @@ def normalize_phone(raw_phone: str):
     return None
 
 
-def get_phone_info(phone: str) -> dict:
-    """
-    Получает информацию о регионе и операторе по номеру телефона.
-    """
-    info = {
-        "region": None,
-        "operator": None,
-        "old_operator": None
-    }
-    if not phone:
-        return info
-
-    url = "http://num.voxlink.ru/get/"
-    params = {"num": phone}
-
-    try:
-        response = requests.get(url, params=params, timeout=5)
-        response.raise_for_status()
-
-        data = response.json()
-        logging.info(f"Для номера {phone} получен ответ от num.voxlink.ru: {data}")
-
-        info["region"] = data.get("region")
-        info["operator"] = data.get("operator")
-        info["old_operator"] = data.get("old_operator")
-
-    except (requests.exceptions.RequestException, ValueError) as e:
-        logging.error(f"Ошибка при запросе к num.voxlink.ru для номера {phone}: {e}. Запись будет создана без данных о регионе.")
-
-    return info
-
-
-def get_existing_lead_dates(conn, webhook_source: str, start_date: date) -> set[date]:
+def get_existing_lead_dates(conn, webhook_source: str, start_date: date) -> set:
     """
     Получает из БД множество дат, за которые уже есть лиды для данного портала.
     """
@@ -220,7 +259,7 @@ def get_existing_lead_dates(conn, webhook_source: str, start_date: date) -> set[
         cursor.close()
 
 
-def calculate_missing_date_ranges(existing_dates: set[date], start_date: date) -> list[dict]:
+def calculate_missing_date_ranges(existing_dates: set, start_date: date) -> list:
     """
     Вычисляет НЕПРЕРЫВНЫЕ ДИАПАЗОНЫ дат, отсутствующие в БД, и создает для них фильтры.
     """
@@ -277,7 +316,7 @@ def get_all_leads(webhook_url, date_filter):
             'start': start
         }
         try:
-            logging.info(f"Запрос к Bitrix24 API: метод={method}, start={start}")
+            logging.info(f"[API] Запрос к Bitrix24: метод={method}, start={start}")
             response = requests.post(f"{webhook_url}{method}", json=params, timeout=30)
             response.raise_for_status()
             data = response.json()
@@ -285,28 +324,28 @@ def get_all_leads(webhook_url, date_filter):
             if 'result' in data and data['result']:
                 fetched_count = len(data['result'])
                 leads_for_period.extend(data['result'])
-                logging.info(f"Получено {fetched_count} лидов. Всего за этот вызов: {len(leads_for_period)}")
+                logging.info(f"[API] Получено {fetched_count} лидов. Всего за этот вызов: {len(leads_for_period)}")
 
                 if 'next' in data:
                     start = data['next']
                 else:
-                    logging.info("Все страницы для данного периода загружены.")
+                    logging.info("[API] Все страницы для данного периода загружены.")
                     break
             else:
-                logging.info("На этой странице нет результатов. Завершение для данного периода.")
+                logging.info("[API] На этой странице нет результатов. Завершение для данного периода.")
                 break
 
         except requests.exceptions.Timeout:
-            logging.error(f"Тайм-аут запроса к {webhook_url} (превышено 30 секунд).")
+            logging.error(f"[API] Тайм-аут запроса к {webhook_url} (превышено 30 секунд).")
             break
         except requests.exceptions.RequestException as e:
-            logging.error(f"Ошибка при запросе к {webhook_url}: {e}")
+            logging.error(f"[API] Ошибка при запросе к {webhook_url}: {e}")
             break
 
     return leads_for_period
 
 
-def save_leads_to_db(conn, leads, webhook_source, phone_info_cache):
+def save_leads_to_db(conn, leads, webhook_source, phone_info_cache, rossvyaz_finder):
     """Сохраняет или обновляет лиды в базе данных, пропуская дубликаты по номеру телефона."""
     if not leads:
         return 0
@@ -338,7 +377,7 @@ def save_leads_to_db(conn, leads, webhook_source, phone_info_cache):
             lead_phone_map[normalized_phone].append(lead)
 
     if not lead_phone_map:
-        logging.info("В полученной пачке нет лидов с корректными номерами телефонов.")
+        logging.info("[SAVE] В полученной пачке нет лидов с корректными номерами телефонов.")
         cursor.close()
         return 0
 
@@ -352,9 +391,9 @@ def save_leads_to_db(conn, leads, webhook_source, phone_info_cache):
         for (phone,) in cursor.fetchall():
             existing_phones.add(phone)
         if existing_phones:
-            logging.info(f"Найдено {len(existing_phones)} уже существующих номеров в БД из {len(lead_phone_map)} уникальных номеров в этой пачке.")
+            logging.info(f"[SAVE] Найдено {len(existing_phones)} уже существующих номеров в БД из {len(lead_phone_map)} уникальных.")
     except mysql.connector.Error as err:
-        logging.error(f"Ошибка при проверке существующих номеров в БД: {err}")
+        logging.error(f"[SAVE] Ошибка при проверке существующих номеров в БД: {err}")
         cursor.close()
         return 0
 
@@ -363,15 +402,18 @@ def save_leads_to_db(conn, leads, webhook_source, phone_info_cache):
     new_phones = set(lead_phone_map.keys()) - existing_phones
 
     if not new_phones:
-        logging.info(f"Нет новых уникальных номеров для добавления. Пропущено {len(leads)} лидов.")
+        logging.info(f"[SAVE] Нет новых уникальных номеров для добавления. Пропущено {len(leads)} лидов.")
         cursor.close()
         return 0
 
-    logging.info(f"Будет обработано {len(new_phones)} новых уникальных номеров.")
+    total_new = len(new_phones)
+    logging.info(f"[SAVE] Будет обработано {total_new} новых уникальных номеров.")
 
-    for phone_number in new_phones:
+    for idx, phone_number in enumerate(new_phones, 1):
+        logging.info(f"[SAVE] Обработка номера {idx}/{total_new}: {phone_number}")
         lead = lead_phone_map[phone_number][0]
 
+        # --- Email ---
         email = None
         if lead.get('emailWork'):
             email = lead.get('emailWork')
@@ -387,6 +429,7 @@ def save_leads_to_db(conn, leads, webhook_source, phone_info_cache):
             if not email and lead['EMAIL'][0].get('VALUE'):
                 email = lead['EMAIL'][0]['VALUE']
 
+        # --- Web ---
         web = (
             lead.get('web') if lead.get('web')
             else (
@@ -396,12 +439,33 @@ def save_leads_to_db(conn, leads, webhook_source, phone_info_cache):
             )
         )
 
+        # --- Регион и оператор через базу Россвязи ---
         if phone_number in phone_info_cache:
             phone_info = phone_info_cache[phone_number]
-            logging.info(f"Информация для номера {phone_number} взята из кэша.")
+            logging.info(f"[CACHE] Информация для номера {phone_number} взята из кэша.")
         else:
-            phone_info = get_phone_info(phone_number)
+            result = rossvyaz_finder.find(phone_number)
+            if result:
+                phone_info = {
+                    "region": result.get("region"),
+                    "operator": result.get("operator"),
+                    "old_operator": None
+                }
+                logging.info(f"[ROSSVYAZ] Номер {phone_number} -> регион: {phone_info['region']}, оператор: {phone_info['operator']}")
+            else:
+                phone_info = {
+                    "region": None,
+                    "operator": None,
+                    "old_operator": None
+                }
+                logging.warning(f"[ROSSVYAZ] Номер {phone_number} не найден в ranges.csv.")
+
             phone_info_cache[phone_number] = phone_info
+
+        # --- Пропускаем лиды без региона ---
+        if not phone_info.get('region'):
+            logging.warning(f"[SKIP] Номер {phone_number} пропущен: регион не определён.")
+            continue
 
         data_to_insert.append((
             webhook_source, lead.get('ID'), lead.get('TITLE'), lead.get('NAME'),
@@ -416,9 +480,11 @@ def save_leads_to_db(conn, leads, webhook_source, phone_info_cache):
 
     # --- Шаг 4: Сохранение данных в БД ---
     if not data_to_insert:
-        logging.info("Нет данных для вставки в БД.")
+        logging.info("[SAVE] Нет данных для вставки в БД (все пропущены из-за отсутствия региона).")
         cursor.close()
         return 0
+
+    logging.info(f"[SAVE] Вставка {len(data_to_insert)} записей в БД...")
 
     insert_query = f"""
         INSERT INTO {TABLE_NAME} (
@@ -446,13 +512,14 @@ def save_leads_to_db(conn, leads, webhook_source, phone_info_cache):
     try:
         cursor.executemany(insert_query, data_to_insert)
         conn.commit()
+        logging.info(f"[SAVE] Успешно сохранено {cursor.rowcount} записей.")
         return cursor.rowcount
     except mysql.connector.Error as err:
         if err.errno == 1213:
-            logging.error(f"ОБНАРУЖЕН DEADLOCK при сохранении данных. Пропускаем эту пачку. Ошибка: {err}")
+            logging.error(f"[SAVE] DEADLOCK при сохранении данных. Пропускаем пачку. Ошибка: {err}")
             conn.rollback()
         else:
-            logging.error(f"Ошибка при сохранении данных в БД: {err}")
+            logging.error(f"[SAVE] Ошибка при сохранении данных в БД: {err}")
         return 0
     finally:
         cursor.close()
@@ -480,34 +547,46 @@ if __name__ == "__main__":
         start_date_obj = datetime.strptime(START_DATE, "%Y-%m-%d").date()
         phone_cache = {}
 
-        for webhook in WEBHOOKS:
+        # --- Загрузка базы Россвязи один раз ---
+        ranges_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ranges.csv')
+        if not os.path.exists(ranges_file):
+            logging.error(f"Файл ranges.csv не найден по пути: {ranges_file}. Завершаю работу.")
+            sys.exit(1)
+
+        rossvyaz_finder = RossvyazMobile(ranges_file)
+
+        total_webhooks = len(WEBHOOKS)
+        for wh_idx, webhook in enumerate(WEBHOOKS, 1):
             portal_url = webhook.split('/rest/')[0]
-            logging.info(f"--- Начинаю обработку портала: {portal_url} ---")
+            logging.info(f"=== [{wh_idx}/{total_webhooks}] Начинаю обработку портала: {portal_url} ===")
 
             existing_dates = get_existing_lead_dates(db_connection, portal_url, start_date_obj)
             missing_date_filters = calculate_missing_date_ranges(existing_dates, start_date_obj)
 
             if not missing_date_filters:
                 logging.info(f"Нет пропущенных дат для загрузки для портала {portal_url}. Все актуально.")
-                logging.info(f"--- Завершил обработку: {portal_url} ---\n")
+                logging.info(f"=== Завершил обработку: {portal_url} ===\n")
                 continue
 
             total_leads_for_portal = 0
+            total_filters = len(missing_date_filters)
 
-            for date_filter in missing_date_filters:
-                filter_str = next(iter(date_filter.values()))
-                logging.info(f"Загрузка лидов для периода: {filter_str}...")
+            for f_idx, date_filter in enumerate(missing_date_filters, 1):
+                filter_str = f"{date_filter.get('>=DATE_CREATE', '?')} — {date_filter.get('<=DATE_CREATE', '?')}"
+                logging.info(f"[PERIOD {f_idx}/{total_filters}] Загрузка лидов для периода: {filter_str}")
 
                 leads_for_period = get_all_leads(webhook, date_filter)
-                logging.info(f"Найдено {len(leads_for_period)} лидов для выгрузки в этом периоде.")
+                logging.info(f"[PERIOD {f_idx}/{total_filters}] Найдено {len(leads_for_period)} лидов.")
 
                 if leads_for_period:
-                    saved_count = save_leads_to_db(db_connection, leads_for_period, portal_url, phone_cache)
-                    logging.info(f"Сохранено/обновлено {saved_count} записей в БД.")
+                    saved_count = save_leads_to_db(
+                        db_connection, leads_for_period, portal_url, phone_cache, rossvyaz_finder
+                    )
+                    logging.info(f"[PERIOD {f_idx}/{total_filters}] Сохранено/обновлено {saved_count} записей в БД.")
                     total_leads_for_portal += saved_count
 
             logging.info(f"Всего сохранено/обновлено для портала {portal_url}: {total_leads_for_portal} записей.")
-            logging.info(f"--- Завершил обработку: {portal_url} ---\n")
+            logging.info(f"=== Завершил обработку: {portal_url} ===\n")
 
     except mysql.connector.Error as err:
         logging.error(f"Ошибка подключения к БД: {err}")
