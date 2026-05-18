@@ -546,6 +546,12 @@ def tilda_webhook():
 
     logging.info(f"[WEBHOOK] Данные запроса: {data}")
 
+    # Подробное логирование всех полей
+    logging.info("[WEBHOOK] === ПОДРОБНЫЙ РАЗБОР ПОЛЕЙ ===")
+    for key, value in data.items():
+        logging.info(f"[WEBHOOK]   Ключ: '{key}' | Значение: '{value}' | Тип ключа: {type(key).__name__} | Тип значения: {type(value).__name__}")
+    logging.info("[WEBHOOK] === КОНЕЦ РАЗБОРА ПОЛЕЙ ===")
+
     # Если это тестовый запрос от Tilda — просто отвечаем OK, лид не создаём
     if is_tilda_test_request(data):
         logging.info("[WEBHOOK] Обнаружен тестовый запрос от Tilda. Возвращаю OK без создания лида.")
@@ -590,6 +596,22 @@ def tilda_webhook():
             data.get('region') or
             ''
     )
+
+    # Логируем все варианты поиска региона
+    logging.info(f"[WEBHOOK] === ПОИСК РЕГИОНА В ФОРМЕ ===")
+    logging.info(f"[WEBHOOK]   data.get('Укажите регион проживания') = '{data.get('Укажите регион проживания')}'")
+    logging.info(f"[WEBHOOK]   data.get('Укажите регион проживания:') = '{data.get('Укажите регион проживания:')}'")
+    logging.info(f"[WEBHOOK]   data.get('region') = '{data.get('region')}'")
+    logging.info(f"[WEBHOOK]   Итоговый form_region = '{form_region}'")
+    logging.info(f"[WEBHOOK]   utm_region = '{utm_region}'")
+
+    # --- Определяем отдел продаж ---
+    # --- Логируем что именно пойдет в определение отдела ---
+    logging.info(f"[WEBHOOK] === ОПРЕДЕЛЕНИЕ ОТДЕЛА ===")
+    logging.info(f"[WEBHOOK]   form_region (из формы): '{form_region}'")
+    logging.info(f"[WEBHOOK]   utm_region: '{utm_region}'")
+    logging.info(f"[WEBHOOK]   phone: '{phone}'")
+    logging.info(f"[WEBHOOK] === НАЧИНАЮ ОПРЕДЕЛЕНИЕ ===")
 
     # --- Определяем отдел продаж ---
     uf_crm_value, department_source = determine_department(
