@@ -18,7 +18,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', filename='bb.log', force=True)
 
 # Укажите дату, с которой начинать выгрузку лидов, в формате ГГГГ-ММ-ДД
-START_DATE = "2026-03-01"
+START_DATE = "2026-05-10"
 
 # Список вебхуков Bitrix24 (из переменных окружения)
 _raw_webhooks = os.getenv('BITRIX_WEBHOOKS', '')
