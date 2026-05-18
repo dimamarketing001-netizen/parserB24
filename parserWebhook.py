@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 
 # Укажите дату, с которой начинать выгрузку лидов, в формате ГГГГ-ММ-ДД
-START_DATE = "2026-02-01"
+START_DATE = "2026-01-01"
 
 # Список вебхуков Bitrix24 (из переменных окружения)
 _raw_webhooks = os.getenv('BITRIX_WEBHOOKS', '')
