@@ -192,6 +192,33 @@ def normalize_phone(raw_phone: str):
 
     return None
 
+def extract_phone(data: dict):
+    """
+    Пытается найти телефон в данных Tilda по разным вариантам названий поля.
+    """
+    possible_keys = [
+        'Phone', 'phone', 'PHONE',
+        'Телефон', 'телефон', 'ТЕЛЕФОН',
+        'Ваш телефон', 'ваш телефон',
+        'Номер телефона', 'номер телефона',
+        'contact_phone', 'inputPhone'
+    ]
+
+    for key in possible_keys:
+        value = data.get(key)
+        if value and str(value).strip():
+            logging.info(f"[WEBHOOK] Телефон найден по ключу '{key}': {value}")
+            return str(value).strip()
+
+    for key, value in data.items():
+        key_lower = str(key).lower().strip()
+        if any(marker in key_lower for marker in ['phone', 'телефон', 'номер']):
+            if value and str(value).strip():
+                logging.info(f"[WEBHOOK] Телефон найден по похожему ключу '{key}': {value}")
+                return str(value).strip()
+
+    logging.warning("[WEBHOOK] Телефон не найден ни в одном поле.")
+    return ''
 
 def determine_department(form_region: str, utm_region: str, phone: str, rossvyaz_finder) -> tuple:
     """
@@ -499,13 +526,17 @@ def health_check():
     return jsonify({"status": "ok", "message": "Tilda webhook server is running"}), 200
 
 
-@app.route('/webhook/tilda', methods=['POST'])
+@app.route('/webhook/tilda', methods=['GET', 'POST'])
 def tilda_webhook():
     """
     Принимает заявки от Tilda и создает/обрабатывает лиды в Bitrix24.
     """
     logging.info("=" * 60)
     logging.info("[WEBHOOK] Получен запрос от Tilda")
+
+    if request.method == 'GET':
+        logging.info("[WEBHOOK] GET-запрос для проверки доступности.")
+        return jsonify({"status": "ok", "message": "Webhook is available"}), 200
 
     # Получаем данные из запроса
     if request.is_json:
