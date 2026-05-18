@@ -334,7 +334,7 @@ if __name__ == "__main__":
     # 2. Получаем лидов из БД за последние 24 часа по всем целевым регионам
     leads_from_db = []
     sales_department_counts = {58: 0, 60: 0}  # дефолт на случай ошибки БД
-    start_date = datetime.now() - timedelta(days=300)
+    start_date = datetime.now() - timedelta(days=1)
 
     # Формируем плейсхолдеры для IN-запроса динамически
     region_placeholders = ', '.join(['%s'] * len(ALL_TARGET_REGIONS))
