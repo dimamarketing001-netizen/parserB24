@@ -41,6 +41,10 @@ UF_CRM_FIELD = 'UF_CRM_1779024295'
 UF_CRM_VALUE_EKATERINBURG = 58
 UF_CRM_VALUE_CHELYABINSK = 60
 
+# Ответственные по отделам
+ASSIGNED_CHELYABINSK = 64
+ASSIGNED_DEFAULT = 1
+
 # --- Списки регионов для определения отдела ---
 
 # Свердловская область и города
@@ -654,7 +658,9 @@ def tilda_webhook():
     )
 
     department_name = "Екатеринбург" if uf_crm_value == 58 else "Челябинск"
-    logging.info(f"[WEBHOOK] Отдел: {department_name} ({uf_crm_value}). Источник: {department_source}")
+    assigned_by_id = ASSIGNED_CHELYABINSK if uf_crm_value == UF_CRM_VALUE_CHELYABINSK else ASSIGNED_DEFAULT
+    logging.info(
+        f"[WEBHOOK] Отдел: {department_name} ({uf_crm_value}). Ответственный: {assigned_by_id}. Источник: {department_source}")
 
     # --- Собираем комментарии из всех полей формы ---
     comments = build_comments(data)
@@ -722,7 +728,8 @@ def tilda_webhook():
             utm_campaign=utm_campaign,
             utm_content=utm_content,
             utm_term=utm_term,
-            source_description=department_source
+            source_description=department_source,
+            assigned_by_id=assigned_by_id
         )
 
         if new_lead_id:
