@@ -628,7 +628,6 @@ def tilda_webhook():
     else:
         utm_region = raw_utm_region
 
-    # Регион из формы (поле "Укажите регион проживания")
     form_region = extract_form_region(data)
 
     # Логируем все варианты поиска региона
