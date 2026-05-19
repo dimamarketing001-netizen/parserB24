@@ -409,8 +409,17 @@ def create_lead(
         status_id: str = "NEW",
         opened: str = "Y"
 ):
-    """Создает новый лид в Bitrix24."""
+    """
+    Создает новый лид в Bitrix24.
+    При ошибке повторяет до 10 раз с интервалом 3 секунды.
+    Если все попытки неудачны — отправляет уведомление в Telegram.
+    """
+    import time
+
     url = webhook + "crm.lead.add"
+    source_id = str(source_id).strip() if source_id else "WEB"
+    max_retries = 10
+    retry_delay = 3
 
     fields = {
         "TITLE": title,
@@ -424,7 +433,6 @@ def create_lead(
         UF_CRM_FIELD: uf_crm_value,
     }
 
-    # UTM метки
     if utm_source:
         fields["UTM_SOURCE"] = utm_source
     if utm_medium:
@@ -448,25 +456,62 @@ def create_lead(
     }
     headers = {'Content-Type': 'application/json'}
 
-    try:
-        response = requests.post(url, data=json.dumps(data), headers=headers, timeout=30)
-        response.raise_for_status()
-        result = response.json()
-        if 'result' in result:
-            logging.info(f"[CREATE] Лид создан. ID: {result['result']}. {UF_CRM_FIELD}={uf_crm_value}")
-            return result['result']
-        elif 'error' in result:
-            logging.error(f"[CREATE] Ошибка Bitrix24: {result['error']}: {result.get('error_description', '')}")
-            return None
-        else:
-            logging.error("[CREATE] Неизвестная ошибка при создании лида.")
-            return None
-    except requests.exceptions.RequestException as e:
-        logging.error(f"[CREATE] Ошибка запроса: {e}")
-        return None
-    except json.JSONDecodeError as e:
-        logging.error(f"[CREATE] Ошибка JSON: {e}")
-        return None
+    last_error = ""
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            logging.info(f"[CREATE] Попытка {attempt}/{max_retries}. SOURCE_ID={source_id}, ASSIGNED_BY_ID={assigned_by_id}, {UF_CRM_FIELD}={uf_crm_value}")
+
+            if attempt == 1:
+                logging.info(f"[CREATE] Payload: {json.dumps(data, ensure_ascii=False)}")
+
+            response = requests.post(url, data=json.dumps(data), headers=headers, timeout=30)
+            response.raise_for_status()
+
+            result = response.json()
+            logging.info(f"[CREATE] Ответ Bitrix24: {result}")
+
+            if 'result' in result:
+                logging.info(f"[CREATE] Лид создан. ID: {result['result']}. Попытка: {attempt}/{max_retries}")
+                return result['result']
+
+            elif 'error' in result:
+                last_error = f"{result['error']}: {result.get('error_description', '')}"
+                logging.error(f"[CREATE] Ошибка Bitrix24 (попытка {attempt}/{max_retries}): {last_error}")
+            else:
+                last_error = f"Неизвестный ответ: {result}"
+                logging.error(f"[CREATE] {last_error}")
+
+        except requests.exceptions.RequestException as e:
+            last_error = str(e)
+            logging.error(f"[CREATE] Ошибка запроса (попытка {attempt}/{max_retries}): {e}")
+
+        except json.JSONDecodeError as e:
+            last_error = str(e)
+            logging.error(f"[CREATE] Ошибка JSON (попытка {attempt}/{max_retries}): {e}")
+
+        # Если не последняя попытка — ждем перед следующей
+        if attempt < max_retries:
+            logging.info(f"[CREATE] Жду {retry_delay} сек перед попыткой {attempt + 1}...")
+            time.sleep(retry_delay)
+
+    # Все попытки исчерпаны
+    logging.error(f"[CREATE] Все {max_retries} попыток исчерпаны. Лид НЕ создан.")
+
+    department_name = "Екатеринбург" if uf_crm_value == 58 else "Челябинск"
+    tg_error_message = (
+        f"🚨 *ОШИБКА: Не удалось создать лид в CRM*\n\n"
+        f"Телефон: `{phone}`\n"
+        f"Имя: {name if name else '-'}\n"
+        f"Отдел: {department_name}\n"
+        f"SOURCE\\_ID: {source_id}\n"
+        f"Попыток: {max_retries}\n"
+        f"Последняя ошибка: {last_error}\n\n"
+        f"Лид нужно создать вручную!"
+    )
+    send_telegram_message(tg_error_message)
+
+    return None
 
 
 def get_lead_details(lead_id):
