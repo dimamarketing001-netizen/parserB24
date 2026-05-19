@@ -335,8 +335,7 @@ def send_telegram_message(message: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         'chat_id': TELEGRAM_CHAT_ID,
-        'text': message,
-        'parse_mode': 'Markdown'
+        'text': message
     }
     try:
         response = requests.post(url, json=payload, timeout=10)
@@ -629,7 +628,12 @@ def tilda_webhook():
     logging.info(f"[WEBHOOK] Данные запроса: {data}")
 
     # Проверяем параметр dep_id из URL (приоритетный отдел)
+    # Проверяем параметры из URL
     url_dep_id = request.args.get('dep_id')
+    url_source_id = str(request.args.get('source_id', 'WEB')).strip()
+
+    logging.info(f"[WEBHOOK] Параметр dep_id из URL: '{url_dep_id}'")
+    logging.info(f"[WEBHOOK] Параметр source_id из URL: '{url_source_id}'")
 
     # Подробное логирование всех полей
     logging.info("[WEBHOOK] === ПОДРОБНЫЙ РАЗБОР ПОЛЕЙ ===")
@@ -782,6 +786,7 @@ def tilda_webhook():
             utm_campaign=utm_campaign,
             utm_content=utm_content,
             utm_term=utm_term,
+            source_id=url_source_id,
             source_description=department_source,
             assigned_by_id=assigned_by_id
         )
