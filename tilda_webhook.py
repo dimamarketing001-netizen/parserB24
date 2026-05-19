@@ -77,6 +77,13 @@ CHELYABINSK_REGIONS = {
 # Поля которые НЕ нужно включать в комментарии (телефон и UTM)
 EXCLUDED_COMMENT_FIELDS = {
     'phone', 'Phone', 'PHONE',
+    'Телефон', 'телефон', 'ТЕЛЕФОН',
+    'Ваш телефон', 'ваш телефон',
+    'Номер телефона', 'номер телефона',
+    'contact_phone', 'inputPhone',
+    'ct_phone',
+    'dep_id',
+    'source_id',
     'utm_source', 'UTM_SOURCE', 'utm_medium', 'UTM_MEDIUM',
     'utm_campaign', 'UTM_CAMPAIGN', 'utm_content', 'UTM_CONTENT',
     'utm_term', 'UTM_TERM', 'utm_region', 'utm_region_id', 'utm_yclid',
@@ -644,12 +651,16 @@ def tilda_webhook():
     logging.info("=" * 60)
     logging.info("[WEBHOOK] Получен запрос от Tilda")
 
-    if request.method == 'GET':
+    # GET без ct_phone — просто проверка доступности
+    if request.method == 'GET' and not request.args.get('ct_phone'):
         logging.info("[WEBHOOK] GET-запрос для проверки доступности.")
         return jsonify({"status": "ok", "message": "Webhook is available"}), 200
 
     # Получаем данные из запроса
-    if request.is_json:
+    if request.method == 'GET':
+        data = request.args.to_dict()
+        logging.info("[WEBHOOK] GET-запрос с параметром ct_phone. Обрабатываю как рабочий запрос.")
+    elif request.is_json:
         data = request.get_json()
     else:
         data = request.form.to_dict()
@@ -683,8 +694,14 @@ def tilda_webhook():
 
     # --- Извлекаем поля ---
 
-    # Телефон
-    raw_phone = extract_phone(data)
+    # Телефон: сначала из URL параметра ct_phone, потом из тела запроса
+    url_ct_phone = request.args.get('ct_phone', '').strip()
+    if url_ct_phone:
+        raw_phone = url_ct_phone
+        logging.info(f"[WEBHOOK] Телефон получен из URL параметра ct_phone: {raw_phone}")
+    else:
+        raw_phone = extract_phone(data)
+
     phone = normalize_phone(raw_phone)
 
     if not phone:
