@@ -585,7 +585,6 @@ def tilda_webhook():
 
     # Проверяем параметр dep_id из URL (приоритетный отдел)
     url_dep_id = request.args.get('dep_id')
-    logging.info(f"[WEBHOOK] Параметр dep_id из URL: '{url_dep_id}'")
 
     # Подробное логирование всех полей
     logging.info("[WEBHOOK] === ПОДРОБНЫЙ РАЗБОР ПОЛЕЙ ===")
