@@ -98,25 +98,58 @@ def save_processed_phones(file_path: str, phones_to_save: set):
     except IOError as e:
         print(f"Не удалось сохранить телефоны обработанных лидов: {e}")
 
-
 def send_telegram_message(message: str):
     """
-    Отправляет сообщение в телеграм группу.
+    Отправляет сообщение в Telegram.
+    Принудительно использует IPv4 и повторяет до 5 раз при ошибке.
     """
+    import time
+    import socket
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.warning("[TELEGRAM] Токен или chat_id не настроены.")
+        return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         'chat_id': TELEGRAM_CHAT_ID,
         'text': message,
-        'parse_mode': 'Markdown'
+        'parse_mode': 'HTML'
     }
-    try:
-        response = requests.post(url, json=payload, timeout=10)
-        if response.status_code >= 400:
-            print(f"Подробный ответ от API Telegram: {response.text}")
-        response.raise_for_status()
-        print("Сообщение в телеграм успешно отправлено.")
-    except requests.exceptions.RequestException as e:
-        print(f"Ошибка при отправке сообщения в телеграм: {e}")
+
+    max_retries = 5
+    retry_delay = 3
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            # Принудительно IPv4 через монкипатчинг socket
+            old_getaddrinfo = socket.getaddrinfo
+
+            def ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+                return old_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+            socket.getaddrinfo = ipv4_only_getaddrinfo
+
+            try:
+                response = requests.post(url, json=payload, timeout=10)
+            finally:
+                # Обязательно восстанавливаем оригинальный getaddrinfo
+                socket.getaddrinfo = old_getaddrinfo
+
+            if response.status_code >= 400:
+                logging.warning(f"[TELEGRAM] Ответ API (попытка {attempt}/{max_retries}): {response.text}")
+
+            response.raise_for_status()
+            logging.info(f"[TELEGRAM] Сообщение успешно отправлено (попытка {attempt}/{max_retries}).")
+            return
+
+        except requests.exceptions.RequestException as e:
+            logging.error(f"[TELEGRAM] Ошибка отправки (попытка {attempt}/{max_retries}): {e}")
+            if attempt < max_retries:
+                logging.info(f"[TELEGRAM] Жду {retry_delay} сек перед попыткой {attempt + 1}...")
+                time.sleep(retry_delay)
+
+    logging.error(f"[TELEGRAM] Все {max_retries} попыток исчерпаны. Сообщение не отправлено.")
 
 def build_telegram_report(
     leads_found_db: int,
