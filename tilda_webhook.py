@@ -583,6 +583,10 @@ def tilda_webhook():
 
     logging.info(f"[WEBHOOK] Данные запроса: {data}")
 
+    # Проверяем параметр dep_id из URL (приоритетный отдел)
+    url_dep_id = request.args.get('dep_id')
+    logging.info(f"[WEBHOOK] Параметр dep_id из URL: '{url_dep_id}'")
+
     # Подробное логирование всех полей
     logging.info("[WEBHOOK] === ПОДРОБНЫЙ РАЗБОР ПОЛЕЙ ===")
     for key, value in data.items():
@@ -650,12 +654,18 @@ def tilda_webhook():
     logging.info(f"[WEBHOOK] === НАЧИНАЮ ОПРЕДЕЛЕНИЕ ===")
 
     # --- Определяем отдел продаж ---
-    uf_crm_value, department_source = determine_department(
-        form_region=form_region,
-        utm_region=utm_region,
-        phone=phone,
-        rossvyaz_finder=rossvyaz_finder
-    )
+    # Приоритет 0: параметр dep_id из URL
+    if url_dep_id and url_dep_id in ('58', '60'):
+        uf_crm_value = int(url_dep_id)
+        department_source = f"По параметру dep_id из URL: {url_dep_id}"
+        logging.info(f"[DEPARTMENT] Принудительно задан через URL dep_id={url_dep_id}")
+    else:
+        uf_crm_value, department_source = determine_department(
+            form_region=form_region,
+            utm_region=utm_region,
+            phone=phone,
+            rossvyaz_finder=rossvyaz_finder
+        )
 
     department_name = "Екатеринбург" if uf_crm_value == 58 else "Челябинск"
     assigned_by_id = ASSIGNED_CHELYABINSK if uf_crm_value == UF_CRM_VALUE_CHELYABINSK else ASSIGNED_DEFAULT
