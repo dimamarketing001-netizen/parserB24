@@ -335,7 +335,8 @@ def send_telegram_message(message: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         'chat_id': TELEGRAM_CHAT_ID,
-        'text': message
+        'text': message,
+        'parse_mode': 'HTML'
     }
     try:
         response = requests.post(url, json=payload, timeout=10)
@@ -372,6 +373,34 @@ def get_duplicate_lead_id(phone):
     except (json.JSONDecodeError, IndexError) as e:
         logging.error(f"[DUPLICATE] Ошибка обработки ответа: {e}")
         return None
+
+def get_source_name(source_id: str) -> str:
+    """
+    Получает человекочитаемое название источника из Bitrix24 по SOURCE_ID.
+    Например: 'UC_11UXNN' -> 'LeadGen', '16' -> 'LeadGen2'
+    """
+    url = webhook + "crm.status.list"
+    params = {
+        "filter[ENTITY_ID]": "SOURCE",
+        "filter[STATUS_ID]": source_id
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        result = response.json().get('result', [])
+
+        if result and len(result) > 0:
+            name = result[0].get('NAME', source_id)
+            logging.info(f"[SOURCE] Источник '{source_id}' -> '{name}'")
+            return name
+        else:
+            logging.warning(f"[SOURCE] Источник '{source_id}' не найден в справочнике.")
+            return source_id
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"[SOURCE] Ошибка получения имени источника: {e}")
+        return source_id
 
 def is_tilda_test_request(data: dict) -> bool:
     """
@@ -499,11 +528,11 @@ def create_lead(
 
     department_name = "Екатеринбург" if uf_crm_value == 58 else "Челябинск"
     tg_error_message = (
-        f"🚨 *ОШИБКА: Не удалось создать лид в CRM*\n\n"
-        f"Телефон: `{phone}`\n"
+        f"🚨 <b>ОШИБКА: Не удалось создать лид в CRM</b>\n\n"
+        f"Телефон: <code>{phone}</code>\n"
         f"Имя: {name if name else '-'}\n"
         f"Отдел: {department_name}\n"
-        f"SOURCE\\_ID: {source_id}\n"
+        f"SOURCE_ID: {source_id}\n"
         f"Попыток: {max_retries}\n"
         f"Последняя ошибка: {last_error}\n\n"
         f"Лид нужно создать вручную!"
@@ -635,6 +664,9 @@ def tilda_webhook():
     logging.info(f"[WEBHOOK] Параметр dep_id из URL: '{url_dep_id}'")
     logging.info(f"[WEBHOOK] Параметр source_id из URL: '{url_source_id}'")
 
+    source_name = get_source_name(url_source_id)
+    logging.info(f"[WEBHOOK] Имя источника: '{source_name}'")
+
     # Подробное логирование всех полей
     logging.info("[WEBHOOK] === ПОДРОБНЫЙ РАЗБОР ПОЛЕЙ ===")
     for key, value in data.items():
@@ -756,11 +788,11 @@ def tilda_webhook():
 
             # Отправляем уведомление в телеграм
             tg_message = (
-                f"*Повторная заявка (Рекламный лид)*\n\n"
-                f"Телефон: `{phone}`\n"
+                f"<b>Повторная заявка (Рекламный лид)</b>\n\n"
+                f"Телефон: <code>{phone}</code>\n"
                 f"Имя: {name if name else '-'}\n"
                 f"Отдел: {department_name}\n"
-                f"Источник: {department_source}\n"
+                f"Источник: {source_name}\n"
                 f"Существующий лид: #{duplicate_lead_id}\n"
                 f"Создана задача: #{task_id if task_id else 'Ошибка'}"
             )
@@ -797,12 +829,12 @@ def tilda_webhook():
 
             # Отправляем уведомление в телеграм
             tg_message = (
-                f"*Новый Рекламный лид*\n\n"
-                f"Телефон: `{phone}`\n"
+                f"<b>Новый Рекламный лид</b>\n\n"
+                f"Телефон: <code>{phone}</code>\n"
                 f"Имя: {name if name else '-'}\n"
                 f"Email: {email if email else '-'}\n"
                 f"Отдел: {department_name}\n"
-                f"Источник: {department_source}\n"
+                f"Источник: {source_name}\n"
                 f"UTM Source: {utm_source if utm_source else '-'}\n"
                 f"ID лида: #{new_lead_id}"
             )
