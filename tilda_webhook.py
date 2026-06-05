@@ -853,7 +853,6 @@ def tilda_webhook():
                 im_text = (
                     f"🔔 Повторная заявка!\n\n"
                     f"Клиент снова оставил заявку.\n"
-                    f"Телефон: {phone}\n"
                     f"Имя: {name if name else '-'}\n"
                     f"Отдел: {department_name}\n"
                     f"Источник: {source_name}\n"
