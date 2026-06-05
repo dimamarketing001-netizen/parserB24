@@ -817,37 +817,75 @@ def tilda_webhook():
     }
 
     if duplicate_lead_id:
-        # Дубликат найден
         logging.info(f"[WEBHOOK] Обнаружен дубликат. ID лида: {duplicate_lead_id}")
         result_data["action"] = "duplicate"
         result_data["lead_id"] = duplicate_lead_id
 
         details = get_lead_details(duplicate_lead_id)
 
+        # 1. Всегда ставим статус NEW — без условий
+        status_updated = update_lead_status(duplicate_lead_id, "NEW")
+        result_data["status_reset_to_new"] = status_updated
+        logging.info(
+            f"[WEBHOOK] Статус лида {duplicate_lead_id} -> NEW: "
+            f"{'OK' if status_updated else 'ОШИБКА'}"
+        )
+
+        task_id = None
+        im_message_id = None
+
         if details and details.get("ASSIGNED_BY_ID"):
-            # Создаем задачу
-            task_id = create_b24_task(duplicate_lead_id, details["ASSIGNED_BY_ID"])
+            responsible_id = int(details["ASSIGNED_BY_ID"])
+
+            # 2. Задача ответственному менеджеру
+            task_id = create_b24_task(duplicate_lead_id, responsible_id)
             result_data["task_id"] = task_id
 
-            # Выводим из спама если нужно
-            if details["STATUS_ID"] in SPAM_STATUS_IDS:
-                if update_lead_status(duplicate_lead_id, "NEW"):
-                    result_data["rescued_from_spam"] = True
-                    logging.info(f"[WEBHOOK] Лид {duplicate_lead_id} выведен из спама.")
-
-            # Отправляем уведомление в телеграм
-            tg_message = (
-                f"<b>Повторная заявка (Рекламный лид)</b>\n\n"
-                f"Телефон: <code>{phone}</code>\n"
-                f"Имя: {name if name else '-'}\n"
-                f"Отдел: {department_name}\n"
-                f"Источник: {source_name}\n"
-                f"Существующий лид: #{duplicate_lead_id}\n"
-                f"Создана задача: #{task_id if task_id else 'Ошибка'}"
+            # 3. Динамически получаем руководителя отдела из Б24
+            head_id = get_department_head(uf_crm_value)
+            logging.info(
+                f"[WEBHOOK] Руководитель отдела '{department_name}': "
+                f"{'ID=' + str(head_id) if head_id else 'не назначен'}"
             )
-            send_telegram_message(tg_message)
+
+            # 4. Отправляем личное сообщение руководителю
+            if head_id:
+                im_text = (
+                    f"🔔 Повторная заявка!\n\n"
+                    f"Клиент снова оставил заявку.\n"
+                    f"Телефон: {phone}\n"
+                    f"Имя: {name if name else '-'}\n"
+                    f"Отдел: {department_name}\n"
+                    f"Источник: {source_name}\n"
+                    f"Лид: #{duplicate_lead_id}\n"
+                    f"Задача: {'#' + str(task_id) if task_id else 'ошибка создания'}"
+                )
+                im_message_id = send_im_message(head_id, im_text)
+                result_data["im_message_id"] = im_message_id
+            else:
+                logging.warning(
+                    f"[WEBHOOK] Руководитель '{department_name}' не назначен "
+                    f"в Б24 — личное сообщение не отправлено."
+                )
+
         else:
-            logging.warning(f"[WEBHOOK] Не удалось получить детали дубликата {duplicate_lead_id}")
+            logging.warning(
+                f"[WEBHOOK] Не удалось получить детали дубликата {duplicate_lead_id}"
+            )
+
+        # 5. Telegram — всегда
+        tg_message = (
+            f"<b>Повторная заявка (Рекламный лид)</b>\n\n"
+            f"Телефон: <code>{phone}</code>\n"
+            f"Имя: {name if name else '-'}\n"
+            f"Отдел: {department_name}\n"
+            f"Источник: {source_name}\n"
+            f"Существующий лид: #{duplicate_lead_id}\n"
+            f"Статус -> NEW: {'✅' if status_updated else '❌'}\n"
+            f"Задача менеджеру: {'#' + str(task_id) if task_id else '❌'}\n"
+            f"Сообщение руководителю: {'✅' if im_message_id else '❌'}"
+        )
+        send_telegram_message(tg_message)
 
     else:
         # Новый лид
@@ -896,6 +934,111 @@ def tilda_webhook():
     logging.info(f"[WEBHOOK] Результат: {result_data}")
     return jsonify(result_data), 200
 
+
+# --- Маппинг UF_CRM значения -> ID отдела в Б24 ---
+# UF_CRM_VALUE_CHELYABINSK  = 60 -> отдел ID=16
+# UF_CRM_VALUE_EKATERINBURG = 58 -> отдел ID=10
+DEPARTMENT_B24_ID = {
+    UF_CRM_VALUE_CHELYABINSK: "16",
+    UF_CRM_VALUE_EKATERINBURG: "10",
+}
+
+
+def get_department_head(uf_crm_value: int):
+    """
+    Динамически запрашивает руководителя отдела из Б24.
+
+    Находит ID отдела по UF_CRM значению, затем запрашивает
+    department.get и возвращает UF_HEAD (ID руководителя).
+
+    Возвращает int или None если руководитель не назначен.
+    """
+    dept_id = DEPARTMENT_B24_ID.get(uf_crm_value)
+
+    if not dept_id:
+        logging.warning(f"[HEAD] Нет маппинга отдела для UF_CRM={uf_crm_value}")
+        return None
+
+    url = webhook + "department.get"
+    params = {"ID": dept_id}
+
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        result = response.json().get('result', [])
+
+        if not result:
+            logging.warning(f"[HEAD] Отдел ID={dept_id} не найден в Б24")
+            return None
+
+        dept = result[0]
+        uf_head = dept.get('UF_HEAD')
+
+        # UF_HEAD может быть "0", 0, None или строкой с ID
+        if not uf_head or str(uf_head) == "0":
+            logging.warning(
+                f"[HEAD] У отдела '{dept.get('NAME')}' (ID={dept_id}) "
+                f"руководитель не назначен (UF_HEAD={uf_head})"
+            )
+            return None
+
+        head_id = int(uf_head)
+        logging.info(
+            f"[HEAD] Отдел '{dept.get('NAME')}' (ID={dept_id}) -> "
+            f"руководитель ID={head_id}"
+        )
+        return head_id
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"[HEAD] Ошибка запроса department.get: {e}")
+        return None
+    except (ValueError, IndexError, KeyError) as e:
+        logging.error(f"[HEAD] Ошибка обработки ответа department.get: {e}")
+        return None
+
+
+def send_im_message(to_user_id: int, message: str):
+    """
+    Отправляет личное сообщение пользователю через im.message.add.
+
+    DIALOG_ID=XXX где XXX — ID пользователя (личный чат).
+    """
+    url = webhook + "im.message.add"
+
+    data = {
+        "DIALOG_ID": str(to_user_id),  # просто ID пользователя = личный чат
+        "MESSAGE": message,
+        "SYSTEM": "N",
+        "URL_PREVIEW": "N"
+    }
+
+    headers = {'Content-Type': 'application/json'}
+
+    try:
+        response = requests.post(url, data=json.dumps(data), headers=headers, timeout=10)
+        response.raise_for_status()
+        result = response.json()
+
+        if result.get('result'):
+            msg_id = result['result']
+            logging.info(
+                f"[IM] Личное сообщение отправлено пользователю ID={to_user_id}. "
+                f"Message ID={msg_id}"
+            )
+            return msg_id
+
+        elif result.get('error'):
+            error = result.get('error')
+            error_desc = result.get('error_description', '')
+            logging.error(
+                f"[IM] Ошибка отправки сообщения пользователю ID={to_user_id}: "
+                f"{error} — {error_desc}"
+            )
+            return None
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"[IM] Ошибка запроса im.message.add: {e}")
+        return None
 
 if __name__ == "__main__":
     logging.info(f"[SERVER] Запуск сервера на {SERVER_HOST}:{SERVER_PORT}")
