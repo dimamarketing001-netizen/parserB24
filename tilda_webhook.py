@@ -27,7 +27,7 @@ logging.basicConfig(
 
 # --- Bitrix24 Configuration ---
 webhook = os.getenv('BITRIX_WEBHOOK')
-BITRIX_BASE_URL = os.getenv('BITRIX_BASE_URL', 'https://your-portal.bitrix24.ru')  # Базовый URL портала без /rest/
+BITRIX_BASE_URL = os.getenv('BITRIX_BASE_URL', 'https://b24-p41gmg.bitrix24.ru')  # Базовый URL портала без /rest/
 SPAM_STATUS_IDS = ["JUNK", "SPAM", "10", "9", "8", "7", "6", "5", "4", "3", "2", "1"]
 
 # --- Telegram Logging Configuration ---
@@ -1271,8 +1271,6 @@ def notify_assignee_new_lead(
     message = (
         f"🆕 На вас создан новый лид!\n\n"
         f"Имя клиента: {lead_name}\n"
-        f"Телефон: {phone}\n"
-        f"Источник: {source_name}\n"
         f"Отдел: {department_name}\n\n"
         f"Возьмите лид в работу как можно скорее!\n"
         f"Ссылка на лид: {lead_url}"
@@ -1466,9 +1464,7 @@ def tilda_webhook():
                     f"ℹ️ Повторная заявка на конвертированный лид!\n\n"
                     f"Клиент снова оставил заявку, но лид уже конвертирован.\n"
                     f"Имя: {name if name else '-'}\n"
-                    f"Телефон: {phone}\n"
                     f"Отдел: {department_name}\n"
-                    f"Источник: {source_name}\n"
                     f"Ссылка на лид: {lead_url}"
                 )
                 im_message_id = send_im_message(head_id, converted_msg)
@@ -1497,9 +1493,7 @@ def tilda_webhook():
                         f"🔔 Повторная заявка!\n\n"
                         f"Клиент снова оставил заявку.\n"
                         f"Имя: {name if name else '-'}\n"
-                        f"Телефон: {phone}\n"
                         f"Отдел: {department_name}\n"
-                        f"Источник: {source_name}\n"
                         f"Ссылка на лид: {lead_url}\n"
                         f"Задача: {'#' + str(task_id) if task_id else 'ошибка создания'}"
                     )
