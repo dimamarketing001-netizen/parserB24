@@ -1154,7 +1154,7 @@ def _monitor_lead_acceptance(monitor_data: dict):
                 f"📋 Вам назначен лид!\n\n"
                 f"Лид: {lead_name}\n"
                 f"Отдел: {department_name}\n"
-                f"Возьмите его в работу как можно скорее.\n"
+                f"Возьмите его в работу как можно скорее!\n"
                 f"Ссылка: {lead_url}"
             )
             # db_save_event(lead_id, b24_assigned_id, 'reassigned')
@@ -1272,8 +1272,6 @@ def notify_assignee_new_lead(
         user_id,
         f"🆕 На вас создан новый лид!\n\n"
         f"Клиент: {lead_name}\n"
-        f"Телефон: {phone}\n"
-        f"Источник: {source_name}\n"
         f"Отдел: {department_name}\n\n"
         f"Возьмите лид в работу как можно скорее!\n"
         f"Ссылка: {lead_url}"
@@ -1412,9 +1410,7 @@ def tilda_webhook():
                     f"ℹ️ Повторная заявка на конвертированный лид!\n\n"
                     f"Клиент снова оставил заявку, но лид уже конвертирован.\n"
                     f"Имя: {name or '-'}\n"
-                    f"Телефон: {phone}\n"
                     f"Отдел: {department_name}\n"
-                    f"Источник: {source_name}\n"
                     f"Ссылка: {lead_url}"
                 )
         else:
@@ -1431,8 +1427,8 @@ def tilda_webhook():
                         head_id,
                         f"🔔 Повторная заявка!\n\n"
                         f"Клиент снова оставил заявку.\n"
-                        f"Имя: {name or '-'}\nТелефон: {phone}\n"
-                        f"Отдел: {department_name}\nИсточник: {source_name}\n"
+                        f"Имя: {name or '-'}\n"
+                        f"Отдел: {department_name}\n"
                         f"Задача: {'#' + str(task_id) if task_id else 'ошибка'}\n"
                         f"Ссылка: {lead_url}"
                     )
@@ -1493,12 +1489,14 @@ def tilda_webhook():
             send_telegram_message(
                 f"<b>Новый Рекламный лид</b>\n\n"
                 f"Телефон: <code>{phone}</code>\n"
-                f"Имя: {name or '-'}\nEmail: {email or '-'}\n"
-                f"Отдел: {department_name}\nИсточник: {source_name}\n"
+                f"Имя: {name or '-'}\n"
+                f"Отдел: {department_name}\n"
+                f"Источник: {source_name}\n"
                 f"Ответственный: {assignee['name']} (ID={assigned_by_id})\n"
                 f"Распределение: {assignee['reason']}\n"
                 f"UTM: {utm_source or '-'}\n"
-                f"ID: #{new_lead_id}\nСсылка: {lead_url}"
+                f"ID: #{new_lead_id}\n"
+                f"Ссылка: {lead_url}"
             )
         else:
             result_data.update({"action": "error", "message": "Не удалось создать лид"})
