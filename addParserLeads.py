@@ -440,7 +440,7 @@ if __name__ == "__main__":
                 new_b24_lead_id = create_lead(
                     title="LeadGen2",
                     status_id="NEW",
-                    assigned_by_id=1,
+                    assigned_by_id=32,
                     phone=phone_number,
                     opened="Y",
                     source_id="16",
