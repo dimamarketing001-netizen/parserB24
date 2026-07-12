@@ -9,6 +9,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
+import mysql.connector
 
 # --- ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ---
 load_dotenv()
@@ -31,6 +32,15 @@ logging.basicConfig(
 # Bitrix24
 webhook = os.getenv('BITRIX_WEBHOOK')
 BITRIX_BASE_URL = os.getenv('BITRIX_BASE_URL', 'https://b24-p41gmg.bitrix24.ru')
+
+# MySQL
+DB_CONFIG = {
+    'host': os.getenv('DB_HOST', '127.0.0.1'),
+    'port': int(os.getenv('DB_PORT', 3306)),
+    'user': os.getenv('DB_USER'),
+    'password': os.getenv('DB_PASSWORD'),
+    'database': os.getenv('DB_NAME'),
+}
 
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -73,13 +83,7 @@ DEPARTMENT_B24_ID = {
 # ============================================================
 # --- MySQL (закомментировано — БД ещё не доступна) ---
 # ============================================================
-# DB_CONFIG = {
-#     'host': '5.141.91.138',
-#     'port': 3001,
-#     'user': 'dima',
-#     'password': 'vRZVgh6c@@.',
-#     'database': 'b24_data'
-# }
+
 #
 # Схема таблиц:
 #
@@ -115,7 +119,7 @@ DEPARTMENT_B24_ID = {
 #     INDEX (user_id),
 #     INDEX (event_at)
 # );
-#
+
 # Метрики для аналитики:
 # - Среднее время принятия:   AVG(seconds_elapsed) WHERE event_type='accepted' GROUP BY user_id
 # - Лидов за период:          COUNT(*) WHERE event_type='assigned' GROUP BY user_id
@@ -124,48 +128,46 @@ DEPARTMENT_B24_ID = {
 # - Лучший сотрудник:         MIN(AVG(seconds_elapsed)) GROUP BY user_id
 # - Худший сотрудник:         MAX(AVG(seconds_elapsed)) GROUP BY user_id
 
-# import mysql.connector
-#
-# def get_db_connection():
-#     try:
-#         return mysql.connector.connect(**DB_CONFIG)
-#     except mysql.connector.Error as e:
-#         logging.error(f"[DB] Ошибка подключения: {e}")
-#         return None
-#
-# def db_save_assignment(lead_id, user_id, department, phone, work_hours):
-#     conn = get_db_connection()
-#     if not conn: return
-#     try:
-#         cursor = conn.cursor()
-#         cursor.execute(
-#             "INSERT INTO lead_assignments "
-#             "(lead_id, assigned_user, department, phone, created_at, work_hours) "
-#             "VALUES (%s,%s,%s,%s,%s,%s)",
-#             (lead_id, user_id, department, phone, datetime.now(), 1 if work_hours else 0)
-#         )
-#         conn.commit()
-#     except mysql.connector.Error as e:
-#         logging.error(f"[DB] Ошибка сохранения назначения: {e}")
-#     finally:
-#         conn.close()
-#
-# def db_save_event(lead_id, user_id, event_type, seconds_elapsed=None):
-#     conn = get_db_connection()
-#     if not conn: return
-#     try:
-#         cursor = conn.cursor()
-#         cursor.execute(
-#             "INSERT INTO lead_response_events "
-#             "(lead_id, user_id, event_type, event_at, seconds_elapsed) "
-#             "VALUES (%s,%s,%s,%s,%s)",
-#             (lead_id, user_id, event_type, datetime.now(), seconds_elapsed)
-#         )
-#         conn.commit()
-#     except mysql.connector.Error as e:
-#         logging.error(f"[DB] Ошибка сохранения события: {e}")
-#     finally:
-#         conn.close()
+def get_db_connection():
+    try:
+        return mysql.connector.connect(**DB_CONFIG)
+    except mysql.connector.Error as e:
+        logging.error(f"[DB] Ошибка подключения: {e}")
+        return None
+
+def db_save_assignment(lead_id, user_id, department, phone, work_hours):
+    conn = get_db_connection()
+    if not conn: return
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO lead_assignments "
+            "(lead_id, assigned_user, department, phone, created_at, work_hours) "
+            "VALUES (%s,%s,%s,%s,%s,%s)",
+            (lead_id, user_id, department, phone, datetime.now(), 1 if work_hours else 0)
+        )
+        conn.commit()
+    except mysql.connector.Error as e:
+        logging.error(f"[DB] Ошибка сохранения назначения: {e}")
+    finally:
+        conn.close()
+
+def db_save_event(lead_id, user_id, event_type, seconds_elapsed=None):
+    conn = get_db_connection()
+    if not conn: return
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO lead_response_events "
+            "(lead_id, user_id, event_type, event_at, seconds_elapsed) "
+            "VALUES (%s,%s,%s,%s,%s)",
+            (lead_id, user_id, event_type, datetime.now(), seconds_elapsed)
+        )
+        conn.commit()
+    except mysql.connector.Error as e:
+        logging.error(f"[DB] Ошибка сохранения события: {e}")
+    finally:
+        conn.close()
 
 # ============================================================
 # --- РЕГИОНЫ ---
@@ -213,10 +215,6 @@ EXCLUDED_COMMENT_FIELDS = {
 # ============================================================
 # --- КЭШ-СЧЁТЧИК (защита от гонки условий) ---
 # ============================================================
-# Хранит количество назначений за текущий день МСК.
-# Структура: {'date': date, 'counts': {user_id: int}}
-# Сбрасывается автоматически при смене даты.
-# Инициализируется из Б24 один раз в начале дня.
 
 _assignment_cache_lock = threading.Lock()
 _assignment_cache: dict = {
@@ -244,23 +242,14 @@ def _reset_cache_if_new_day():
 def _init_cache_from_bitrix(user_ids: list):
     """
     Инициализирует кэш реальными данными из Б24 ОДИН РАЗ за день.
-    Учитывает лиды созданные до запуска сервера.
-
-    Логика:
-    - Если counts пустой → делаем батч-запрос в Б24 и заполняем
-    - Если counts уже есть → пропускаем (кэш актуален)
-    - Двойная проверка под локом защищает от одновременной инициализации
     """
-    # Первая проверка без лока (быстро)
     with _assignment_cache_lock:
         _reset_cache_if_new_day()
         if _assignment_cache['counts']:
-            return  # уже инициализирован
+            return
 
-    # Запрашиваем Б24 БЕЗ лока (запрос может занять время)
     real_counts = get_users_active_leads_today_batch(user_ids)
 
-    # Вторая проверка под локом перед записью
     with _assignment_cache_lock:
         if not _assignment_cache['counts']:
             _assignment_cache['counts'] = real_counts
@@ -270,12 +259,7 @@ def _init_cache_from_bitrix(user_ids: list):
 def _atomic_select_and_increment(user_ids: list, bitrix_counts: dict) -> list:
     """
     Атомарно выбирает сотрудника с минимальной нагрузкой и
-    увеличивает его счётчик. Всё под одним локом — гонка невозможна.
-
-    Нагрузка = данные из Б24 + локальный кэш (назначения этой сессии).
-
-    Возвращает список workload отсортированный по total (первый = выбранный).
-    Каждый элемент: {'id', 'b24_count', 'cache_count', 'total'}
+    увеличивает его счётчик.
     """
     with _assignment_cache_lock:
         _reset_cache_if_new_day()
@@ -291,12 +275,9 @@ def _atomic_select_and_increment(user_ids: list, bitrix_counts: dict) -> list:
                 'total': b24 + cache,
             })
 
-        # Сортируем и выбираем минимум прямо здесь под локом
         workload.sort(key=lambda x: x['total'])
         chosen_id = workload[0]['id']
 
-        # Атомарно инкрементируем — следующий параллельный запрос
-        # уже увидит обновлённый счётчик
         prev = _assignment_cache['counts'].get(chosen_id, 0)
         _assignment_cache['counts'][chosen_id] = prev + 1
 
@@ -479,7 +460,6 @@ def determine_department(form_region: str, utm_region: str,
     2. UTM регион
     3. Регион по телефону (Россвязь)
     4. По умолчанию — Челябинск
-    Возвращает (uf_crm_value, description)
     """
     if form_region:
         r = form_region.lower().strip()
@@ -518,7 +498,7 @@ def build_comments(data: dict) -> str:
 
 
 def is_tilda_test_request(data: dict) -> bool:
-    """True если это тестовый пинг от Tilda (нет телефона и почти нет данных)."""
+    """True если это тестовый пинг от Tilda."""
     raw_phone = extract_phone(data)
     meaningful = [
         str(v).strip() for v in data.values()
@@ -534,7 +514,6 @@ def is_tilda_test_request(data: dict) -> bool:
 def get_online_users(dept_b24_id: str) -> list:
     """
     Возвращает онлайн-пользователей отдела (IS_ONLINE=Y).
-    Руководитель ВКЛЮЧЁН — он участвует в распределении наравне со всеми.
     Возвращает список: [{'id': int, 'name': str}, ...]
     """
     url = webhook + "user.get"
@@ -566,14 +545,8 @@ def get_online_users(dept_b24_id: str) -> list:
 
 def get_users_active_leads_today_batch(user_ids: list) -> dict:
     """
-    Один батч-запрос к Б24: считает АКТИВНЫЕ лиды за сегодня
+    Батч-запрос к Б24: считает активные лиды за сегодня
     для каждого из переданных сотрудников.
-
-    Активные = созданы сегодня (МСК) + статус НЕ CONVERTED и НЕ JUNK.
-
-    Почему батч: N сотрудников = 1 запрос вместо N отдельных.
-    Поддерживает пагинацию на случай большого числа лидов.
-
     Возвращает: {user_id: count, ...}
     """
     if not user_ids:
@@ -582,15 +555,12 @@ def get_users_active_leads_today_batch(user_ids: list) -> dict:
     today_str = datetime.now(timezone(timedelta(hours=3))).strftime('%Y-%m-%d')
     url = webhook + "crm.lead.list"
 
-    # Строим параметры одного запроса для всех user_ids
     params = {
         "select[]": ["ID", "ASSIGNED_BY_ID"],
         "filter[>=DATE_CREATE]": today_str,
     }
-    # filter[ASSIGNED_BY_ID][0..N] = OR по всем сотрудникам
     for i, uid in enumerate(user_ids):
         params[f"filter[ASSIGNED_BY_ID][{i}]"] = uid
-    # Исключаем закрытые/мусорные статусы
     for i, status in enumerate(["CONVERTED", "JUNK"]):
         params[f"filter[!STATUS_ID][{i}]"] = status
 
@@ -635,17 +605,6 @@ def get_users_active_leads_today_batch(user_ids: list) -> dict:
 def select_assignee(uf_crm_value: int, head_id: int, fallback_id: int) -> dict:
     """
     Выбирает ответственного сотрудника для нового лида.
-
-    НЕРАБОЧЕЕ ВРЕМЯ (до 7:00 или после 16:00 МСК):
-        → Руководитель отдела (или fallback)
-
-    РАБОЧЕЕ ВРЕМЯ:
-        1. Получаем список онлайн-сотрудников отдела (включая руководителя)
-        2. Если никого нет онлайн → руководитель (или fallback)
-        3. Батч-запрос в Б24: активные лиды за сегодня для каждого
-        4. Инициализируем кэш из Б24 (только первый раз за день)
-        5. Атомарно выбираем с min(b24_count + cache_count) и +1 к кэшу
-
     Возвращает: {'id': int, 'name': str, 'reason': str}
     """
     dept_b24_id = DEPARTMENT_B24_ID.get(uf_crm_value)
@@ -681,20 +640,14 @@ def select_assignee(uf_crm_value: int, head_id: int, fallback_id: int) -> dict:
     user_ids = [u['id'] for u in online_users]
     users_by_id = {u['id']: u['name'] for u in online_users}
 
-    # --- Инициализируем кэш из Б24 (один раз за день) ---
     _init_cache_from_bitrix(user_ids)
-
-    # --- Батч-запрос: активные лиды каждого онлайн-сотрудника ---
     bitrix_counts = get_users_active_leads_today_batch(user_ids)
-
-    # --- Атомарно выбираем и инкрементируем ---
     workload = _atomic_select_and_increment(user_ids, bitrix_counts)
 
-    # Добавляем имена (workload содержит только id и counts)
     for w in workload:
         w['name'] = users_by_id.get(w['id'], f"User {w['id']}")
 
-    chosen = workload[0]  # первый = выбранный (минимальная нагрузка)
+    chosen = workload[0]
 
     logging.info(
         f"[ASSIGN] Выбран: {chosen['name']} (ID={chosen['id']}), "
@@ -715,7 +668,7 @@ def select_assignee(uf_crm_value: int, head_id: int, fallback_id: int) -> dict:
 
 def get_department_head(uf_crm_value: int):
     """
-    Запрашивает руководителя отдела из Б24 (поле UF_HEAD).
+    Запрашивает руководителя отдела из Б24.
     Возвращает int (ID) или None.
     """
     dept_id = DEPARTMENT_B24_ID.get(uf_crm_value)
@@ -868,9 +821,7 @@ def get_source_name(source_id: str) -> str:
 
 
 def get_lead_details(lead_id: int):
-    """
-    Возвращает {'STATUS_ID': str, 'ASSIGNED_BY_ID': str} или None.
-    """
+    """Возвращает {'STATUS_ID': str, 'ASSIGNED_BY_ID': str} или None."""
     try:
         response = requests.get(
             webhook + "crm.lead.get",
@@ -1030,7 +981,7 @@ def create_lead(
 # ============================================================
 
 _lead_monitor_lock = threading.Lock()
-_active_monitors: dict = {}  # {lead_id: monitor_data}
+_active_monitors: dict = {}
 
 
 def start_lead_acceptance_monitor(
@@ -1075,37 +1026,17 @@ def start_lead_acceptance_monitor(
         f"[MONITOR] Запущен для лида {lead_id} → "
         f"user {assigned_user_id} ({assigned_user_name})"
     )
-    # db_save_event(lead_id, assigned_user_id, 'assigned', 0)
 
 
 def _monitor_lead_acceptance(monitor_data: dict):
     """
     Фоновый поток. Каждые 30 сек проверяет лид в Б24.
-
-    Тайминг (от момента назначения):
-      5 мин  → уведомление сотруднику
-      10 мин → уведомление сотруднику
-      15 мин → сотруднику + руководителю
-      30 мин → сотруднику + руководителю
-
-    При смене ответственного:
-      - тайминг сбрасывается (assigned_at = now)
-      - флаги notified_* сбрасываются
-      - новый ответственный получает уведомление
-      - уведомления по новому таймингу идут новому ответственному
-
-    Останавливается если:
-      - статус IN_PROCESS (принят в работу)
-      - статус CONVERTED (конвертирован)
-      - все 4 уведомления отправлены
-      - установлен флаг stop
     """
     import time
 
     lead_id = monitor_data['lead_id']
     CHECK_INTERVAL = 30
 
-    # (timeout_sec, flag_key, уведомлять_руководителя)
     schedule = [
         (NOTIFY_TIMEOUT_1, 'notified_1', False),
         (NOTIFY_TIMEOUT_2, 'notified_2', False),
@@ -1116,13 +1047,11 @@ def _monitor_lead_acceptance(monitor_data: dict):
     while True:
         time.sleep(CHECK_INTERVAL)
 
-        # Проверяем флаг остановки
         with _lead_monitor_lock:
             if monitor_data.get('stop'):
                 logging.info(f"[MONITOR] Лид {lead_id}: остановлен по флагу.")
                 return
 
-        # Читаем актуальное состояние под локом (assigned_at может меняться!)
         with _lead_monitor_lock:
             assigned_at = monitor_data['assigned_at']
             current_assigned_id = monitor_data['assigned_user_id']
@@ -1133,7 +1062,6 @@ def _monitor_lead_acceptance(monitor_data: dict):
 
         elapsed = (datetime.now() - assigned_at).total_seconds()
 
-        # Запрашиваем актуальные данные лида
         details = get_lead_details(lead_id)
         if not details:
             logging.warning(f"[MONITOR] Лид {lead_id}: нет данных, ждём следующей итерации.")
@@ -1148,7 +1076,6 @@ def _monitor_lead_acceptance(monitor_data: dict):
                 f"[MONITOR] Лид {lead_id}: ответственный сменился "
                 f"{current_assigned_id} → {b24_assigned_id}."
             )
-            # Уведомляем нового ответственного
             send_im_message(
                 b24_assigned_id,
                 f"📋 Вам назначен лид!\n\n"
@@ -1157,17 +1084,14 @@ def _monitor_lead_acceptance(monitor_data: dict):
                 f"Возьмите его в работу как можно скорее!\n"
                 f"Ссылка: {lead_url}"
             )
-            # db_save_event(lead_id, b24_assigned_id, 'reassigned')
-
-            # Сбрасываем тайминг и флаги под локом
             with _lead_monitor_lock:
                 monitor_data['assigned_user_id'] = b24_assigned_id
-                monitor_data['assigned_at'] = datetime.now()  # тайминг начинается заново
+                monitor_data['assigned_at'] = datetime.now()
                 monitor_data['notified_1'] = False
                 monitor_data['notified_2'] = False
                 monitor_data['notified_3'] = False
                 monitor_data['notified_4'] = False
-            continue  # assigned_at перечитается в начале следующей итерации
+            continue
 
         # --- Лид принят в работу ---
         if b24_status == STATUS_IN_PROCESS:
@@ -1176,7 +1100,6 @@ def _monitor_lead_acceptance(monitor_data: dict):
                 f"[MONITOR] Лид {lead_id}: принят через "
                 f"{elapsed_int // 60} мин {elapsed_int % 60} сек."
             )
-            # db_save_event(lead_id, current_assigned_id, 'accepted', elapsed_int)
             with _lead_monitor_lock:
                 _active_monitors.pop(lead_id, None)
             return
@@ -1204,7 +1127,7 @@ def _monitor_lead_acceptance(monitor_data: dict):
                     flag_key=flag_key,
                     monitor_data=monitor_data
                 )
-                break  # по одному уведомлению за итерацию
+                break
 
         # --- Все уведомления отправлены ---
         if all(monitor_data.get(f) for f in ['notified_1', 'notified_2', 'notified_3', 'notified_4']):
@@ -1220,17 +1143,12 @@ def _send_acceptance_notification(
         minutes_elapsed: int, notify_head: bool,
         flag_key: str, monitor_data: dict
 ):
-    """
-    Отправляет уведомление о непринятом лиде.
-    Защита от двойной отправки: проверяет и ставит флаг под локом.
-    """
-    # Атомарно проверяем и ставим флаг
+    """Отправляет уведомление о непринятом лиде."""
     with _lead_monitor_lock:
         if monitor_data.get(flag_key):
             return
         monitor_data[flag_key] = True
 
-    # Уведомление сотруднику
     if minutes_elapsed < 15:
         user_msg = (
             f"⚠️ Лид не принят уже {minutes_elapsed} мин!\n\n"
@@ -1247,9 +1165,7 @@ def _send_acceptance_notification(
         )
     send_im_message(user_id, user_msg)
     logging.info(f"[MONITOR] {minutes_elapsed} мин → уведомление user {user_id}, лид {lead_id}")
-    # db_save_event(lead_id, user_id, f'notified_{flag_key[-1]}', minutes_elapsed * 60)
 
-    # Уведомление руководителю (15 и 30 мин)
     if notify_head and head_id:
         send_im_message(
             head_id,
@@ -1277,6 +1193,71 @@ def notify_assignee_new_lead(
         f"Ссылка: {lead_url}"
     )
     logging.info(f"[NOTIFY] Новый лид {lead_id} → user {user_id} ({user_name})")
+
+
+# ============================================================
+# --- ФОНОВАЯ ОБРАБОТКА ДУБЛЯ ---
+# ============================================================
+
+def _process_duplicate(
+        duplicate_lead_id: int, phone: str, name: str,
+        department_name: str, source_name: str, head_id: int
+):
+    """
+    Фоновая обработка дубля после того как 200 уже отдан клиенту.
+    Обновляет статус, создаёт задачу, уведомляет руководителя и Telegram.
+    """
+    lead_url = get_lead_url(duplicate_lead_id)
+    details = get_lead_details(duplicate_lead_id)
+    current_status = details.get('STATUS_ID', '') if details else ''
+
+    status_updated = False
+    task_id = None
+    im_msg_id = None
+
+    if current_status == STATUS_CONVERTED:
+        logging.info(f"[DUP] Лид {duplicate_lead_id}: CONVERTED, статус не меняем.")
+        if head_id:
+            im_msg_id = send_im_message(
+                head_id,
+                f"ℹ️ Повторная заявка на конвертированный лид!\n\n"
+                f"Клиент снова оставил заявку, но лид уже конвертирован.\n"
+                f"Имя: {name or '-'}\n"
+                f"Отдел: {department_name}\n"
+                f"Ссылка: {lead_url}"
+            )
+    else:
+        status_updated = update_lead_status(duplicate_lead_id, STATUS_NEW)
+        if details and details.get("ASSIGNED_BY_ID"):
+            responsible_id = int(details["ASSIGNED_BY_ID"])
+            task_id = create_b24_task(duplicate_lead_id, responsible_id)
+            if head_id:
+                im_msg_id = send_im_message(
+                    head_id,
+                    f"🔔 Повторная заявка!\n\n"
+                    f"Клиент снова оставил заявку.\n"
+                    f"Имя: {name or '-'}\n"
+                    f"Отдел: {department_name}\n"
+                    f"Задача: {'#' + str(task_id) if task_id else 'ошибка'}\n"
+                    f"Ссылка: {lead_url}"
+                )
+
+    send_telegram_message(
+        f"<b>Повторная заявка</b>\n\n"
+        f"Телефон: <code>{phone}</code>\n"
+        f"Имя: {name or '-'}\nОтдел: {department_name}\n"
+        f"Источник: {source_name}\n"
+        f"Лид: #{duplicate_lead_id} | Статус: {current_status}\n"
+        f"→ NEW: {'✅' if status_updated else ('⏩ CONVERTED' if current_status == STATUS_CONVERTED else '❌')}\n"
+        f"Задача: {'#' + str(task_id) if task_id else ('—' if current_status == STATUS_CONVERTED else '❌')}\n"
+        f"Рук-ль уведомлён: {'✅' if im_msg_id else '❌'}\n"
+        f"Ссылка: {lead_url}"
+    )
+
+    logging.info(
+        f"[DUP] Фоновая обработка завершена: лид #{duplicate_lead_id}, "
+        f"status_updated={status_updated}, task_id={task_id}, im_msg_id={im_msg_id}"
+    )
 
 
 # ============================================================
@@ -1367,143 +1348,119 @@ def tilda_webhook():
     department_name = "Екатеринбург" if uf_crm_value == UF_CRM_VALUE_EKATERINBURG else "Челябинск"
     fallback_id = ASSIGNED_CHELYABINSK if uf_crm_value == UF_CRM_VALUE_CHELYABINSK else ASSIGNED_EKATERINBURG
 
-    # Руководитель отдела
+    # Сначала проверяем дубль — до тяжёлых запросов к Б24
+    duplicate_lead_id = get_duplicate_lead_id(phone)
+
+    # Руководитель нужен в обоих случаях (дубль и новый лид)
     head_id = get_department_head(uf_crm_value)
     logging.info(f"[WEBHOOK] Руководитель '{department_name}': {head_id or 'не назначен'}")
 
-    # Выбираем ответственного
+    # Комментарии собираем заранее (нужны только для нового лида, но дёшево)
+    comments = build_comments(data)
+
+    # =================================================
+    # ДУБЛИКАТ — немедленно возвращаем 200, логику в фон
+    # =================================================
+    if duplicate_lead_id:
+        logging.info(
+            f"[WEBHOOK] Дубликат: лид #{duplicate_lead_id}, "
+            f"телефон {phone}. Отвечаем 200 немедленно."
+        )
+        threading.Thread(
+            target=_process_duplicate,
+            args=(duplicate_lead_id, phone, name, department_name,
+                  source_name, head_id),
+            daemon=True,
+            name=f"dup-{duplicate_lead_id}"
+        ).start()
+
+        return jsonify({
+            "status": "ok",
+            "duplicate": True,
+            "lead_id": duplicate_lead_id,
+            "message": "Принято, дубликат"
+        }), 200
+
+    # =================================================
+    # НОВЫЙ ЛИД
+    # =================================================
+
+    # Выбираем ответственного только для нового лида
     assignee = select_assignee(uf_crm_value, head_id or fallback_id, fallback_id)
     assigned_by_id = assignee['id']
-    logging.info(f"[WEBHOOK] Ответственный: ID={assigned_by_id} ({assignee['name']}). {assignee['reason']}")
+    logging.info(
+        f"[WEBHOOK] Ответственный: ID={assigned_by_id} ({assignee['name']}). "
+        f"{assignee['reason']}"
+    )
 
-    comments = build_comments(data)
-    duplicate_lead_id = get_duplicate_lead_id(phone)
+    title = f"Рекламный лид: {name}" if name else "Рекламный лид"
 
-    result_data = {
-        "phone": phone,
-        "department": department_name,
-        "uf_crm_value": uf_crm_value,
-        "department_source": department_source,
-    }
+    new_lead_id = create_lead(
+        title=title, name=name, phone=phone, email=email,
+        comments=comments, uf_crm_value=uf_crm_value,
+        utm_source=utm_source, utm_medium=utm_medium,
+        utm_campaign=utm_campaign, utm_content=utm_content,
+        utm_term=utm_term, source_id=url_source_id,
+        source_description=department_source,
+        assigned_by_id=assigned_by_id
+    )
 
-    if duplicate_lead_id:
-        # =================================================
-        # ДУБЛИКАТ
-        # =================================================
-        lead_url = get_lead_url(duplicate_lead_id)
-        details = get_lead_details(duplicate_lead_id)
-        current_status = details.get('STATUS_ID', '') if details else ''
+    if new_lead_id:
+        lead_url = get_lead_url(new_lead_id)
+        result_data = {
+            "status": "ok",
+            "action": "created",
+            "lead_id": new_lead_id,
+            "phone": phone,
+            "department": department_name,
+            "uf_crm_value": uf_crm_value,
+            "department_source": department_source,
+        }
 
-        result_data.update({"action": "duplicate", "lead_id": duplicate_lead_id})
-        status_updated = False
-        task_id = None
-        im_msg_id = None
+        # db_save_assignment(new_lead_id, assigned_by_id, department_name,
+        #                    phone, is_working_hours())
 
-        if current_status == STATUS_CONVERTED:
-            # Конвертирован — не трогаем статус, только уведомляем руководителя
-            logging.info(f"[WEBHOOK] Лид {duplicate_lead_id}: CONVERTED, статус не меняем.")
-            result_data["note"] = "Лид конвертирован, статус не изменён"
+        notify_assignee_new_lead(
+            lead_id=new_lead_id, user_id=assigned_by_id,
+            user_name=assignee['name'], lead_name=title,
+            source_name=source_name, department_name=department_name,
+            phone=phone
+        )
 
-            if head_id:
-                im_msg_id = send_im_message(
-                    head_id,
-                    f"ℹ️ Повторная заявка на конвертированный лид!\n\n"
-                    f"Клиент снова оставил заявку, но лид уже конвертирован.\n"
-                    f"Имя: {name or '-'}\n"
-                    f"Отдел: {department_name}\n"
-                    f"Ссылка: {lead_url}"
-                )
-        else:
-            # Не конвертирован — сбрасываем в NEW, создаём задачу, уведомляем
-            status_updated = update_lead_status(duplicate_lead_id, STATUS_NEW)
-
-            if details and details.get("ASSIGNED_BY_ID"):
-                responsible_id = int(details["ASSIGNED_BY_ID"])
-                task_id = create_b24_task(duplicate_lead_id, responsible_id)
-                result_data["task_id"] = task_id
-
-                if head_id:
-                    im_msg_id = send_im_message(
-                        head_id,
-                        f"🔔 Повторная заявка!\n\n"
-                        f"Клиент снова оставил заявку.\n"
-                        f"Имя: {name or '-'}\n"
-                        f"Отдел: {department_name}\n"
-                        f"Задача: {'#' + str(task_id) if task_id else 'ошибка'}\n"
-                        f"Ссылка: {lead_url}"
-                    )
-
-        result_data["status_reset_to_new"] = status_updated
-        result_data["im_message_id"] = im_msg_id
+        start_lead_acceptance_monitor(
+            lead_id=new_lead_id, assigned_user_id=assigned_by_id,
+            assigned_user_name=assignee['name'],
+            head_id=head_id or fallback_id,
+            department_name=department_name,
+            lead_name=title, phone=phone
+        )
 
         send_telegram_message(
-            f"<b>Повторная заявка</b>\n\n"
+            f"<b>Новый Рекламный лид</b>\n\n"
             f"Телефон: <code>{phone}</code>\n"
-            f"Имя: {name or '-'}\nОтдел: {department_name}\n"
+            f"Имя: {name or '-'}\n"
+            f"Отдел: {department_name}\n"
             f"Источник: {source_name}\n"
-            f"Лид: #{duplicate_lead_id} | Статус: {current_status}\n"
-            f"→ NEW: {'✅' if status_updated else ('⏩ CONVERTED' if current_status == STATUS_CONVERTED else '❌')}\n"
-            f"Задача: {'#' + str(task_id) if task_id else ('—' if current_status == STATUS_CONVERTED else '❌')}\n"
-            f"Рук-ль уведомлён: {'✅' if im_msg_id else '❌'}\n"
+            f"Ответственный: {assignee['name']} (ID={assigned_by_id})\n"
+            f"Распределение: {assignee['reason']}\n"
+            f"UTM: {utm_source or '-'}\n"
+            f"ID: #{new_lead_id}\n"
             f"Ссылка: {lead_url}"
         )
 
+        logging.info(f"[WEBHOOK] Готово: {result_data}")
+        return jsonify(result_data), 200
+
     else:
-        # =================================================
-        # НОВЫЙ ЛИД
-        # =================================================
-        title = f"Рекламный лид: {name}" if name else "Рекламный лид"
-
-        new_lead_id = create_lead(
-            title=title, name=name, phone=phone, email=email,
-            comments=comments, uf_crm_value=uf_crm_value,
-            utm_source=utm_source, utm_medium=utm_medium,
-            utm_campaign=utm_campaign, utm_content=utm_content,
-            utm_term=utm_term, source_id=url_source_id,
-            source_description=department_source,
-            assigned_by_id=assigned_by_id
-        )
-
-        if new_lead_id:
-            lead_url = get_lead_url(new_lead_id)
-            result_data.update({"action": "created", "lead_id": new_lead_id})
-
-            # db_save_assignment(new_lead_id, assigned_by_id, department_name,
-            #                    phone, is_working_hours())
-
-            notify_assignee_new_lead(
-                lead_id=new_lead_id, user_id=assigned_by_id,
-                user_name=assignee['name'], lead_name=title,
-                source_name=source_name, department_name=department_name,
-                phone=phone
-            )
-
-            start_lead_acceptance_monitor(
-                lead_id=new_lead_id, assigned_user_id=assigned_by_id,
-                assigned_user_name=assignee['name'],
-                head_id=head_id or fallback_id,
-                department_name=department_name,
-                lead_name=title, phone=phone
-            )
-
-            send_telegram_message(
-                f"<b>Новый Рекламный лид</b>\n\n"
-                f"Телефон: <code>{phone}</code>\n"
-                f"Имя: {name or '-'}\n"
-                f"Отдел: {department_name}\n"
-                f"Источник: {source_name}\n"
-                f"Ответственный: {assignee['name']} (ID={assigned_by_id})\n"
-                f"Распределение: {assignee['reason']}\n"
-                f"UTM: {utm_source or '-'}\n"
-                f"ID: #{new_lead_id}\n"
-                f"Ссылка: {lead_url}"
-            )
-        else:
-            result_data.update({"action": "error", "message": "Не удалось создать лид"})
-            return jsonify(result_data), 500
-
-    logging.info(f"[WEBHOOK] Готово: {result_data}")
-    return jsonify(result_data), 200
+        error_data = {
+            "status": "error",
+            "action": "error",
+            "message": "Не удалось создать лид",
+            "phone": phone,
+            "department": department_name,
+        }
+        logging.error(f"[WEBHOOK] Ошибка создания лида: {error_data}")
+        return jsonify(error_data), 500
 
 
 if __name__ == "__main__":
