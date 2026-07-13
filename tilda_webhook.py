@@ -1456,6 +1456,16 @@ def tilda_webhook():
 
     logging.info(f"[WEBHOOK] Данные: {data}")
 
+    # --- Проверяем action ДО любой другой логики ---
+    # Если это booking_update — сразу передаём в обработчик
+    action = request.headers.get('X-Action', '').strip().lower()
+    if not action:
+        action = str(data.get('action', '')).strip().lower()
+
+    if action == 'booking_update':
+        logging.info("[WEBHOOK] Обнаружен action=booking_update → передаём в handle_booking_update.")
+        return handle_booking_update(data)
+
     # Параметры из URL
     url_dep_id = request.args.get('dep_id')
     url_source_id = str(request.args.get('source_id', 'WEB')).strip()
