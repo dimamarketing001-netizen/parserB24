@@ -1810,7 +1810,7 @@ def debt_quiz_webhook():
         logging.error(f"[DEBT-QUIZ] Ошибка создания лида: {error_data}")
         return jsonify(error_data), 500
 
-
+# START
 if __name__ == "__main__":
     logging.info(f"[SERVER] Старт {SERVER_HOST}:{SERVER_PORT}")
     app.run(host=SERVER_HOST, port=SERVER_PORT, debug=False)
