@@ -91,6 +91,35 @@ def get_db_connection():
         logging.error(f"[DB] Ошибка подключения: {e}")
         return None
 
+def get_responsible_phone_from_db(b24_user_id: int) -> dict:
+    """
+    Берёт телефон и имя ответственного из БД.
+    Возвращает {'phone': '+7...', 'name': 'Иван Петров'} или {'phone': None, 'name': None}
+    """
+    conn = get_db_connection()
+    if not conn:
+        return {'phone': None, 'name': None}
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT responsible_phone, b24_name "
+            "FROM user_phones WHERE b24_user_id = %s",
+            (b24_user_id,)
+        )
+        row = cursor.fetchone()
+        if row:
+            logging.info(
+                f"[DB] Телефон для user_id={b24_user_id}: "
+                f"{row[0] or 'null'} ({row[1]})"
+            )
+            return {'phone': row[0], 'name': row[1]}
+        logging.warning(f"[DB] Телефон для user_id={b24_user_id} не найден в БД.")
+        return {'phone': None, 'name': None}
+    except mysql.connector.Error as e:
+        logging.error(f"[DB] Ошибка get_responsible_phone: {e}")
+        return {'phone': None, 'name': None}
+    finally:
+        conn.close()
 
 def db_save_assignment(lead_id, user_id, department, phone, work_hours):
     conn = get_db_connection()
@@ -1410,11 +1439,15 @@ def handle_booking_update(data: dict):
         f"комментарий={'добавлен' if comment_added else 'ошибка'}"
     )
 
+    responsible_info = get_responsible_phone_from_db(responsible_id)
+
     return jsonify({
         "success": True,
         "task_id": str(task_id),
         "lead_id": lead_id,
         "comment_added": comment_added,
+        "responsible_phone": responsible_info['phone'],
+        "responsible_name": responsible_info['name'],
     }), 200
 
 
@@ -1530,7 +1563,7 @@ def tilda_webhook():
     # =================================================
     if duplicate_lead_id:
         logging.info(
-            f"[WEBHOOK] Дубликат: лид #{duplicate_lead_id}, "
+            f"[DEBT-QUIZ] Дубликат: лид #{duplicate_lead_id}, "
             f"телефон {phone}. Отвечаем 200 немедленно."
         )
         threading.Thread(
@@ -1538,14 +1571,22 @@ def tilda_webhook():
             args=(duplicate_lead_id, phone, name, department_name,
                   source_name, head_id),
             daemon=True,
-            name=f"dup-{duplicate_lead_id}"
+            name=f"dup-dq-{duplicate_lead_id}"
         ).start()
+
+        # Берём ответственного из деталей лида
+        dup_details = get_lead_details(duplicate_lead_id)
+        dup_responsible_id = int(dup_details.get('ASSIGNED_BY_ID', 0)) if dup_details else 0
+        dup_responsible_info = get_responsible_phone_from_db(dup_responsible_id) if dup_responsible_id else {
+            'phone': None, 'name': None}
 
         return jsonify({
             "status": "ok",
             "duplicate": True,
             "lead_id": duplicate_lead_id,
-            "message": "Принято, дубликат"
+            "message": "Принято, дубликат",
+            "responsible_phone": dup_responsible_info['phone'],
+            "responsible_name": dup_responsible_info['name'],
         }), 200
 
     # =================================================
@@ -1805,6 +1846,11 @@ def debt_quiz_webhook():
             f"ID лида: #{new_lead_id}\n"
             f"Ссылка: {lead_url}"
         )
+
+        # Получаем телефон ответственного из БД
+        responsible_info = get_responsible_phone_from_db(assigned_by_id)
+        result_data['responsible_phone'] = responsible_info['phone']
+        result_data['responsible_name'] = responsible_info['name']
 
         logging.info(f"[DEBT-QUIZ] Готово: {result_data}")
         return jsonify(result_data), 200
