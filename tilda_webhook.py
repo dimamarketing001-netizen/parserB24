@@ -6,10 +6,10 @@ import logging
 import re
 import os
 import threading
+import mysql.connector
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-import mysql.connector
 
 # --- ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ---
 load_dotenv()
@@ -64,10 +64,10 @@ WORK_START_HOUR = 7   # 07:00 МСК включительно
 WORK_END_HOUR = 16    # 16:00 МСК не включительно
 
 # Таймауты мониторинга принятия лида (секунды)
-NOTIFY_TIMEOUT_1 = 5 * 60    # 5 мин  — предупреждение сотруднику
-NOTIFY_TIMEOUT_2 = 10 * 60   # 10 мин — повторное сотруднику
-NOTIFY_TIMEOUT_3 = 15 * 60   # 15 мин — сотруднику + руководителю
-NOTIFY_TIMEOUT_4 = 30 * 60   # 30 мин — сотруднику + руководителю повторно
+NOTIFY_TIMEOUT_1 = 5 * 60
+NOTIFY_TIMEOUT_2 = 10 * 60
+NOTIFY_TIMEOUT_3 = 15 * 60
+NOTIFY_TIMEOUT_4 = 30 * 60
 
 # Статусы лидов
 STATUS_IN_PROCESS = "IN_PROCESS"
@@ -81,52 +81,8 @@ DEPARTMENT_B24_ID = {
 }
 
 # ============================================================
-# --- MySQL (закомментировано — БД ещё не доступна) ---
+# --- MySQL ---
 # ============================================================
-
-#
-# Схема таблиц:
-#
-# CREATE TABLE lead_assignments (
-#     id            INT AUTO_INCREMENT PRIMARY KEY,
-#     lead_id       INT NOT NULL,
-#     assigned_user INT NOT NULL,
-#     department    VARCHAR(50),
-#     phone         VARCHAR(20),
-#     created_at    DATETIME NOT NULL,
-#     work_hours    TINYINT(1) DEFAULT 1,  -- 1=рабочее, 0=нерабочее
-#     INDEX (lead_id),
-#     INDEX (assigned_user),
-#     INDEX (created_at)
-# );
-#
-# CREATE TABLE lead_response_events (
-#     id              INT AUTO_INCREMENT PRIMARY KEY,
-#     lead_id         INT NOT NULL,
-#     user_id         INT NOT NULL,
-#     event_type      ENUM(
-#                       'assigned',    -- лид назначен сотруднику
-#                       'notified_1',  -- уведомление 5 мин
-#                       'notified_2',  -- уведомление 10 мин
-#                       'notified_3',  -- уведомление 15 мин + руководитель
-#                       'notified_4',  -- уведомление 30 мин + руководитель
-#                       'accepted',    -- лид принят (статус IN_PROCESS)
-#                       'reassigned'   -- лид переназначен
-#                     ) NOT NULL,
-#     event_at        DATETIME NOT NULL,
-#     seconds_elapsed INT,             -- секунд от назначения до события
-#     INDEX (lead_id),
-#     INDEX (user_id),
-#     INDEX (event_at)
-# );
-
-# Метрики для аналитики:
-# - Среднее время принятия:   AVG(seconds_elapsed) WHERE event_type='accepted' GROUP BY user_id
-# - Лидов за период:          COUNT(*) WHERE event_type='assigned' GROUP BY user_id
-# - Принято вовремя (<5 мин): COUNT(*) WHERE event_type='accepted' AND seconds_elapsed < 300
-# - Эскалаций к рук-лю:       COUNT(*) WHERE event_type IN ('notified_3','notified_4')
-# - Лучший сотрудник:         MIN(AVG(seconds_elapsed)) GROUP BY user_id
-# - Худший сотрудник:         MAX(AVG(seconds_elapsed)) GROUP BY user_id
 
 def get_db_connection():
     try:
@@ -135,9 +91,11 @@ def get_db_connection():
         logging.error(f"[DB] Ошибка подключения: {e}")
         return None
 
+
 def db_save_assignment(lead_id, user_id, department, phone, work_hours):
     conn = get_db_connection()
-    if not conn: return
+    if not conn:
+        return
     try:
         cursor = conn.cursor()
         cursor.execute(
@@ -152,9 +110,11 @@ def db_save_assignment(lead_id, user_id, department, phone, work_hours):
     finally:
         conn.close()
 
+
 def db_save_event(lead_id, user_id, event_type, seconds_elapsed=None):
     conn = get_db_connection()
-    if not conn: return
+    if not conn:
+        return
     try:
         cursor = conn.cursor()
         cursor.execute(
@@ -213,7 +173,7 @@ EXCLUDED_COMMENT_FIELDS = {
 }
 
 # ============================================================
-# --- КЭШ-СЧЁТЧИК (защита от гонки условий) ---
+# --- КЭШ-СЧЁТЧИК ---
 # ============================================================
 
 _assignment_cache_lock = threading.Lock()
@@ -224,10 +184,6 @@ _assignment_cache: dict = {
 
 
 def _reset_cache_if_new_day():
-    """
-    Сбрасывает кэш при смене даты МСК.
-    ВАЖНО: вызывать только внутри _assignment_cache_lock!
-    """
     msk_offset = timezone(timedelta(hours=3))
     today = datetime.now(msk_offset).date()
     if _assignment_cache['date'] != today:
@@ -240,9 +196,6 @@ def _reset_cache_if_new_day():
 
 
 def _init_cache_from_bitrix(user_ids: list):
-    """
-    Инициализирует кэш реальными данными из Б24 ОДИН РАЗ за день.
-    """
     with _assignment_cache_lock:
         _reset_cache_if_new_day()
         if _assignment_cache['counts']:
@@ -257,10 +210,6 @@ def _init_cache_from_bitrix(user_ids: list):
 
 
 def _atomic_select_and_increment(user_ids: list, bitrix_counts: dict) -> list:
-    """
-    Атомарно выбирает сотрудника с минимальной нагрузкой и
-    увеличивает его счётчик.
-    """
     with _assignment_cache_lock:
         _reset_cache_if_new_day()
 
@@ -379,18 +328,15 @@ class RossvyazMobile:
 # ============================================================
 
 def get_lead_url(lead_id: int) -> str:
-    """Полная ссылка на лид в Bitrix24."""
     return f"{BITRIX_BASE_URL.rstrip('/')}/crm/lead/details/{lead_id}/"
 
 
 def is_working_hours() -> bool:
-    """True если сейчас рабочее время 07:00–15:59 МСК."""
     now_msk = datetime.now(timezone(timedelta(hours=3)))
     return WORK_START_HOUR <= now_msk.hour < WORK_END_HOUR
 
 
 def normalize_phone(raw_phone: str):
-    """Нормализует телефон → строка 79XXXXXXXXX или None."""
     if not raw_phone or not isinstance(raw_phone, str):
         return None
     digits = re.sub(r'\D', '', raw_phone)
@@ -404,7 +350,6 @@ def normalize_phone(raw_phone: str):
 
 
 def extract_phone(data: dict) -> str:
-    """Ищет телефон в данных формы по известным ключам."""
     possible_keys = [
         'Phone', 'phone', 'PHONE',
         'Телефон', 'телефон', 'ТЕЛЕФОН',
@@ -429,7 +374,6 @@ def extract_phone(data: dict) -> str:
 
 
 def extract_form_region(data: dict) -> str:
-    """Ищет регион проживания в данных формы."""
     possible_keys = [
         'Укажите регион проживания', 'Укажите регион проживания:',
         'Укажите_регион_проживания', 'Укажите_регион_проживания:',
@@ -454,13 +398,6 @@ def extract_form_region(data: dict) -> str:
 
 def determine_department(form_region: str, utm_region: str,
                          phone: str, rossvyaz_finder) -> tuple:
-    """
-    Определяет отдел по приоритету:
-    1. Регион из формы
-    2. UTM регион
-    3. Регион по телефону (Россвязь)
-    4. По умолчанию — Челябинск
-    """
     if form_region:
         r = form_region.lower().strip()
         if 'челябинск' in r or r in CHELYABINSK_REGIONS:
@@ -488,7 +425,6 @@ def determine_department(form_region: str, utm_region: str,
 
 
 def build_comments(data: dict) -> str:
-    """Собирает поля формы (кроме исключённых) в текст для COMMENTS."""
     lines = [
         f"{key}: {value}"
         for key, value in data.items()
@@ -498,7 +434,6 @@ def build_comments(data: dict) -> str:
 
 
 def is_tilda_test_request(data: dict) -> bool:
-    """True если это тестовый пинг от Tilda."""
     raw_phone = extract_phone(data)
     meaningful = [
         str(v).strip() for v in data.values()
@@ -512,10 +447,6 @@ def is_tilda_test_request(data: dict) -> bool:
 # ============================================================
 
 def get_online_users(dept_b24_id: str) -> list:
-    """
-    Возвращает онлайн-пользователей отдела (IS_ONLINE=Y).
-    Возвращает список: [{'id': int, 'name': str}, ...]
-    """
     url = webhook + "user.get"
     params = {
         "ACTIVE": True,
@@ -544,11 +475,6 @@ def get_online_users(dept_b24_id: str) -> list:
 
 
 def get_users_active_leads_today_batch(user_ids: list) -> dict:
-    """
-    Батч-запрос к Б24: считает активные лиды за сегодня
-    для каждого из переданных сотрудников.
-    Возвращает: {user_id: count, ...}
-    """
     if not user_ids:
         return {}
 
@@ -603,10 +529,6 @@ def get_users_active_leads_today_batch(user_ids: list) -> dict:
 
 
 def select_assignee(uf_crm_value: int, head_id: int, fallback_id: int) -> dict:
-    """
-    Выбирает ответственного сотрудника для нового лида.
-    Возвращает: {'id': int, 'name': str, 'reason': str}
-    """
     dept_b24_id = DEPARTMENT_B24_ID.get(uf_crm_value)
     dept_name = (
         "Екатеринбург" if uf_crm_value == UF_CRM_VALUE_EKATERINBURG
@@ -614,7 +536,6 @@ def select_assignee(uf_crm_value: int, head_id: int, fallback_id: int) -> dict:
     )
     effective_head = head_id if head_id else fallback_id
 
-    # --- Нерабочее время ---
     if not is_working_hours():
         logging.info(f"[ASSIGN] Нерабочее время → руководитель ID={effective_head}")
         return {
@@ -623,7 +544,6 @@ def select_assignee(uf_crm_value: int, head_id: int, fallback_id: int) -> dict:
             'reason': 'Нерабочее время — назначен руководитель'
         }
 
-    # --- Рабочее время: кто онлайн? ---
     online_users = get_online_users(dept_b24_id) if dept_b24_id else []
 
     if not online_users:
@@ -667,10 +587,6 @@ def select_assignee(uf_crm_value: int, head_id: int, fallback_id: int) -> dict:
 
 
 def get_department_head(uf_crm_value: int):
-    """
-    Запрашивает руководителя отдела из Б24.
-    Возвращает int (ID) или None.
-    """
     dept_id = DEPARTMENT_B24_ID.get(uf_crm_value)
     if not dept_id:
         logging.warning(f"[HEAD] Нет маппинга для UF_CRM={uf_crm_value}")
@@ -711,7 +627,6 @@ def get_department_head(uf_crm_value: int):
 
 
 def send_im_message(to_user_id: int, message: str):
-    """Отправляет личное сообщение пользователю через im.message.add."""
     try:
         response = requests.post(
             webhook + "im.message.add",
@@ -742,7 +657,6 @@ def send_im_message(to_user_id: int, message: str):
 
 
 def send_telegram_message(message: str):
-    """Отправляет сообщение в Telegram (IPv4, до 5 попыток)."""
     import time
     import socket
 
@@ -778,7 +692,6 @@ def send_telegram_message(message: str):
 
 
 def get_duplicate_lead_id(phone: str):
-    """Ищет дубликат лида по телефону. Возвращает ID или None."""
     try:
         response = requests.post(
             webhook + "crm.duplicate.findbycomm",
@@ -803,7 +716,6 @@ def get_duplicate_lead_id(phone: str):
 
 
 def get_source_name(source_id: str) -> str:
-    """Получает название источника из справочника Б24."""
     try:
         response = requests.get(
             webhook + "crm.status.list",
@@ -821,7 +733,6 @@ def get_source_name(source_id: str) -> str:
 
 
 def get_lead_details(lead_id: int):
-    """Возвращает {'STATUS_ID': str, 'ASSIGNED_BY_ID': str} или None."""
     try:
         response = requests.get(
             webhook + "crm.lead.get",
@@ -843,7 +754,6 @@ def get_lead_details(lead_id: int):
 
 
 def update_lead_status(lead_id: int, status_id: str = "NEW") -> bool:
-    """Обновляет статус лида. Возвращает True при успехе."""
     try:
         response = requests.post(
             webhook + "crm.lead.update",
@@ -861,7 +771,6 @@ def update_lead_status(lead_id: int, status_id: str = "NEW") -> bool:
 
 
 def create_b24_task(lead_id: int, responsible_id: int):
-    """Создаёт задачу 'Повторная заявка' для ответственного."""
     deadline = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%dT%H:%M:%S')
     try:
         response = requests.post(
@@ -893,6 +802,123 @@ def create_b24_task(lead_id: int, responsible_id: int):
         return None
 
 
+def add_lead_timeline_comment(lead_id: int, comment: str) -> bool:
+    """
+    Добавляет запись в ленту лида через crm.timeline.comment.add
+    """
+    try:
+        response = requests.post(
+            webhook + "crm.timeline.comment.add",
+            json={
+                "fields": {
+                    "ENTITY_ID": lead_id,
+                    "ENTITY_TYPE": "lead",
+                    "COMMENT": comment,
+                }
+            },
+            timeout=30
+        )
+        response.raise_for_status()
+        result = response.json()
+        if result.get('result'):
+            logging.info(f"[TIMELINE] Комментарий добавлен к лиду {lead_id}.")
+            return True
+        logging.error(f"[TIMELINE] Ошибка: {result.get('error_description', result)}")
+        return False
+    except requests.exceptions.RequestException as e:
+        logging.error(f"[TIMELINE] Ошибка запроса: {e}")
+        return False
+
+
+def create_booking_task(
+        lead_id: int,
+        responsible_id: int,
+        full_name: str,
+        phone: str,
+        booking_date: str,
+        booking_time: str,
+        booking_address: str
+):
+    """
+    Создаёт задачу менеджеру для подтверждения записи.
+    Дедлайн: за 2 часа до времени записи.
+    """
+    try:
+        # Считаем дедлайн = booking_date + booking_time - 2 часа
+        booking_dt = datetime.strptime(
+            f"{booking_date} {booking_time}", "%Y-%m-%d %H:%M"
+        )
+        deadline_dt = booking_dt - timedelta(hours=2)
+        deadline_str = deadline_dt.strftime('%Y-%m-%dT%H:%M:%S')
+    except ValueError as e:
+        logging.error(f"[BOOKING_TASK] Ошибка парсинга даты/времени: {e}")
+        # Если дата некорректна — дедлайн через день
+        deadline_str = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%dT%H:%M:%S')
+
+    try:
+        response = requests.post(
+            webhook + "tasks.task.add",
+            json={
+                "fields": {
+                    "TITLE": f"Подтвердить запись — {full_name}",
+                    "DESCRIPTION": (
+                        f"Клиент {full_name} ({phone}) записался на {booking_date} "
+                        f"в {booking_time}\n"
+                        f"по адресу: {booking_address}\n\n"
+                        f"Необходимо позвонить и подтвердить запись.\n"
+                        f"Лид: {get_lead_url(lead_id)}"
+                    ),
+                    "RESPONSIBLE_ID": responsible_id,
+                    "UF_CRM_TASK": [f"L_{lead_id}"],
+                    "DEADLINE": deadline_str,
+                }
+            },
+            timeout=30
+        )
+        response.raise_for_status()
+        result = response.json()
+        if result.get('result') and result['result'].get('task'):
+            task_id = result['result']['task']['id']
+            logging.info(f"[BOOKING_TASK] Задача {task_id} создана для лида {lead_id}.")
+            return task_id
+        logging.error(
+            f"[BOOKING_TASK] Не удалось создать: {result.get('error_description', result)}"
+        )
+        return None
+    except requests.exceptions.RequestException as e:
+        logging.error(f"[BOOKING_TASK] Ошибка запроса: {e}")
+        return None
+
+
+def find_lead_by_phone(phone: str):
+    """
+    Ищет лид по телефону через crm.lead.list.
+    Возвращает ID первого найденного или None.
+    """
+    try:
+        response = requests.get(
+            webhook + "crm.lead.list",
+            params={
+                "filter[PHONE]": phone,
+                "select[]": ["ID", "ASSIGNED_BY_ID"],
+                "order[DATE_CREATE]": "DESC",
+                "start": 0,
+            },
+            timeout=15
+        )
+        response.raise_for_status()
+        result = response.json().get('result', [])
+        if result:
+            lead_id = int(result[0]['ID'])
+            logging.info(f"[FIND_LEAD] По телефону {phone} найден лид ID={lead_id}")
+            return lead_id
+        logging.warning(f"[FIND_LEAD] Лид по телефону {phone} не найден.")
+        return None
+    except requests.exceptions.RequestException as e:
+        logging.error(f"[FIND_LEAD] Ошибка: {e}")
+        return None
+
+
 def create_lead(
         title: str, name: str, phone: str, email: str, comments: str,
         uf_crm_value: int, utm_source: str = "", utm_medium: str = "",
@@ -900,10 +926,6 @@ def create_lead(
         source_id: str = "WEB", source_description: str = "",
         assigned_by_id: int = 1, status_id: str = "NEW", opened: str = "Y"
 ):
-    """
-    Создаёт лид в Б24. До 10 попыток с интервалом 3 сек.
-    При полном провале отправляет уведомление в Telegram.
-    """
     import time
 
     source_id = str(source_id).strip() if source_id else "WEB"
@@ -988,10 +1010,6 @@ def start_lead_acceptance_monitor(
         lead_id: int, assigned_user_id: int, assigned_user_name: str,
         head_id: int, department_name: str, lead_name: str, phone: str
 ):
-    """
-    Запускает фоновый поток мониторинга принятия лида.
-    Если для этого лида уже есть мониторинг — останавливает старый.
-    """
     monitor_data = {
         'lead_id': lead_id,
         'assigned_user_id': assigned_user_id,
@@ -1029,9 +1047,6 @@ def start_lead_acceptance_monitor(
 
 
 def _monitor_lead_acceptance(monitor_data: dict):
-    """
-    Фоновый поток. Каждые 30 сек проверяет лид в Б24.
-    """
     import time
 
     lead_id = monitor_data['lead_id']
@@ -1070,7 +1085,6 @@ def _monitor_lead_acceptance(monitor_data: dict):
         b24_status = details.get('STATUS_ID', '')
         b24_assigned_id = int(details.get('ASSIGNED_BY_ID', 0))
 
-        # --- Смена ответственного ---
         if b24_assigned_id and b24_assigned_id != current_assigned_id:
             logging.info(
                 f"[MONITOR] Лид {lead_id}: ответственный сменился "
@@ -1093,7 +1107,6 @@ def _monitor_lead_acceptance(monitor_data: dict):
                 monitor_data['notified_4'] = False
             continue
 
-        # --- Лид принят в работу ---
         if b24_status == STATUS_IN_PROCESS:
             elapsed_int = int(elapsed)
             logging.info(
@@ -1104,14 +1117,12 @@ def _monitor_lead_acceptance(monitor_data: dict):
                 _active_monitors.pop(lead_id, None)
             return
 
-        # --- Лид конвертирован ---
         if b24_status == STATUS_CONVERTED:
             logging.info(f"[MONITOR] Лид {lead_id}: конвертирован. Мониторинг завершён.")
             with _lead_monitor_lock:
                 _active_monitors.pop(lead_id, None)
             return
 
-        # --- Проверяем таймауты ---
         for timeout_sec, flag_key, notify_head in schedule:
             if elapsed >= timeout_sec and not monitor_data.get(flag_key):
                 minutes = timeout_sec // 60
@@ -1129,7 +1140,6 @@ def _monitor_lead_acceptance(monitor_data: dict):
                 )
                 break
 
-        # --- Все уведомления отправлены ---
         if all(monitor_data.get(f) for f in ['notified_1', 'notified_2', 'notified_3', 'notified_4']):
             logging.info(f"[MONITOR] Лид {lead_id}: все уведомления отправлены. Завершаем.")
             with _lead_monitor_lock:
@@ -1143,7 +1153,6 @@ def _send_acceptance_notification(
         minutes_elapsed: int, notify_head: bool,
         flag_key: str, monitor_data: dict
 ):
-    """Отправляет уведомление о непринятом лиде."""
     with _lead_monitor_lock:
         if monitor_data.get(flag_key):
             return
@@ -1175,14 +1184,15 @@ def _send_acceptance_notification(
             f"Ответственный (ID={user_id}) не реагирует.\n"
             f"Ссылка: {lead_url}"
         )
-        logging.info(f"[MONITOR] {minutes_elapsed} мин → уведомление руководитель {head_id}, лид {lead_id}")
+        logging.info(
+            f"[MONITOR] {minutes_elapsed} мин → уведомление руководитель {head_id}, лид {lead_id}"
+        )
 
 
 def notify_assignee_new_lead(
         lead_id: int, user_id: int, user_name: str,
         lead_name: str, source_name: str, department_name: str, phone: str
 ):
-    """Уведомляет сотрудника о назначении нового лида."""
     lead_url = get_lead_url(lead_id)
     send_im_message(
         user_id,
@@ -1203,10 +1213,6 @@ def _process_duplicate(
         duplicate_lead_id: int, phone: str, name: str,
         department_name: str, source_name: str, head_id: int
 ):
-    """
-    Фоновая обработка дубля после того как 200 уже отдан клиенту.
-    Обновляет статус, создаёт задачу, уведомляет руководителя и Telegram.
-    """
     lead_url = get_lead_url(duplicate_lead_id)
     details = get_lead_details(duplicate_lead_id)
     current_status = details.get('STATUS_ID', '') if details else ''
@@ -1258,6 +1264,158 @@ def _process_duplicate(
         f"[DUP] Фоновая обработка завершена: лид #{duplicate_lead_id}, "
         f"status_updated={status_updated}, task_id={task_id}, im_msg_id={im_msg_id}"
     )
+
+
+# ============================================================
+# --- ОБРАБОТЧИК BOOKING_UPDATE ---
+# ============================================================
+
+def handle_booking_update(data: dict):
+    """
+    Обрабатывает запрос доотправки записи клиента (action=booking_update).
+
+    Алгоритм:
+    1. Берём lead_id из запроса или ищем по телефону
+    2. Добавляем комментарий в ленту лида
+    3. Создаём задачу ответственному
+    4. Возвращаем результат
+    """
+    logging.info(f"[BOOKING] Входящий запрос booking_update: {data}")
+
+    # --- Извлекаем поля ---
+    lead_id_raw = data.get('lead_id')
+    ticket_id = data.get('ticket_id', '')
+    phone_raw = data.get('phone', '')
+    full_name = data.get('full_name', '')
+    booking_date = data.get('booking_date', '')
+    booking_time = data.get('booking_time', '')
+    booking_address = data.get('booking_address', '')
+    booked_at = data.get('booked_at', '')
+
+    # Валидация обязательных полей
+    missing = []
+    if not booking_date:
+        missing.append('booking_date')
+    if not booking_time:
+        missing.append('booking_time')
+    if not booking_address:
+        missing.append('booking_address')
+    if not full_name:
+        missing.append('full_name')
+
+    if missing:
+        logging.error(f"[BOOKING] Отсутствуют обязательные поля: {missing}")
+        return jsonify({
+            "success": False,
+            "error": f"Отсутствуют обязательные поля: {', '.join(missing)}"
+        }), 400
+
+    phone = normalize_phone(str(phone_raw)) if phone_raw else None
+
+    # --- Ищем лид ---
+    lead_id = None
+
+    # Сначала по lead_id из запроса
+    if lead_id_raw:
+        try:
+            lead_id = int(lead_id_raw)
+            logging.info(f"[BOOKING] Используем lead_id={lead_id} из запроса.")
+        except (ValueError, TypeError):
+            logging.warning(f"[BOOKING] Некорректный lead_id='{lead_id_raw}', ищем по телефону.")
+
+    # Если lead_id нет или невалиден — ищем по телефону
+    if not lead_id and phone:
+        lead_id = get_duplicate_lead_id(phone) or find_lead_by_phone(phone)
+
+    if not lead_id:
+        logging.error(f"[BOOKING] Лид не найден: lead_id={lead_id_raw}, phone={phone}")
+        return jsonify({
+            "success": False,
+            "error": "Лид не найден по lead_id и по телефону"
+        }), 404
+
+    # --- Получаем детали лида (ответственный) ---
+    details = get_lead_details(lead_id)
+    if not details:
+        logging.error(f"[BOOKING] Не удалось получить данные лида {lead_id}")
+        return jsonify({
+            "success": False,
+            "error": f"Не удалось получить данные лида {lead_id}"
+        }), 500
+
+    responsible_id = int(details.get('ASSIGNED_BY_ID', 0))
+    if not responsible_id:
+        logging.warning(f"[BOOKING] У лида {lead_id} нет ответственного.")
+        return jsonify({
+            "success": False,
+            "error": f"У лида {lead_id} нет ответственного менеджера"
+        }), 500
+
+    # --- Добавляем комментарий в ленту лида ---
+    comment_text = (
+        f"Клиент записался на консультацию:\n"
+        f"📅 Дата: {booking_date}\n"
+        f"🕐 Время: {booking_time}\n"
+        f"📍 Адрес: {booking_address}"
+    )
+    comment_added = add_lead_timeline_comment(lead_id, comment_text)
+
+    if not comment_added:
+        logging.warning(f"[BOOKING] Не удалось добавить комментарий к лиду {lead_id}.")
+
+    # --- Создаём задачу ответственному ---
+    task_id = create_booking_task(
+        lead_id=lead_id,
+        responsible_id=responsible_id,
+        full_name=full_name,
+        phone=str(phone_raw),
+        booking_date=booking_date,
+        booking_time=booking_time,
+        booking_address=booking_address,
+    )
+
+    if not task_id:
+        logging.error(f"[BOOKING] Не удалось создать задачу для лида {lead_id}.")
+        return jsonify({
+            "success": False,
+            "error": "Не удалось создать задачу в Б24"
+        }), 500
+
+    # --- Уведомляем ответственного в Б24 ---
+    send_im_message(
+        responsible_id,
+        f"📅 Клиент записался на консультацию!\n\n"
+        f"Имя: {full_name}\n"
+        f"Телефон: {phone_raw}\n"
+        f"Дата: {booking_date} в {booking_time}\n"
+        f"Адрес: {booking_address}\n\n"
+        f"Задача создана: #{task_id}\n"
+        f"Ссылка на лид: {get_lead_url(lead_id)}"
+    )
+
+    # --- Уведомляем в Telegram ---
+    send_telegram_message(
+        f"<b>Новая запись клиента</b>\n\n"
+        f"Имя: {full_name}\n"
+        f"Телефон: <code>{phone_raw}</code>\n"
+        f"Дата: {booking_date} в {booking_time}\n"
+        f"Адрес: {booking_address}\n"
+        f"Лид: #{lead_id}\n"
+        f"Задача: #{task_id}\n"
+        f"Ссылка: {get_lead_url(lead_id)}"
+    )
+
+    logging.info(
+        f"[BOOKING] Успешно: лид={lead_id}, задача={task_id}, "
+        f"комментарий={'добавлен' if comment_added else 'ошибка'}"
+    )
+
+    return jsonify({
+        "success": True,
+        "task_id": str(task_id),
+        "lead_id": lead_id,
+        "comment_added": comment_added,
+    }), 200
 
 
 # ============================================================
@@ -1348,18 +1506,17 @@ def tilda_webhook():
     department_name = "Екатеринбург" if uf_crm_value == UF_CRM_VALUE_EKATERINBURG else "Челябинск"
     fallback_id = ASSIGNED_CHELYABINSK if uf_crm_value == UF_CRM_VALUE_CHELYABINSK else ASSIGNED_EKATERINBURG
 
-    # Сначала проверяем дубль — до тяжёлых запросов к Б24
+    # Сначала проверяем дубль
     duplicate_lead_id = get_duplicate_lead_id(phone)
 
-    # Руководитель нужен в обоих случаях (дубль и новый лид)
+    # Руководитель нужен в обоих случаях
     head_id = get_department_head(uf_crm_value)
     logging.info(f"[WEBHOOK] Руководитель '{department_name}': {head_id or 'не назначен'}")
 
-    # Комментарии собираем заранее (нужны только для нового лида, но дёшево)
     comments = build_comments(data)
 
     # =================================================
-    # ДУБЛИКАТ — немедленно возвращаем 200, логику в фон
+    # ДУБЛИКАТ
     # =================================================
     if duplicate_lead_id:
         logging.info(
@@ -1384,8 +1541,6 @@ def tilda_webhook():
     # =================================================
     # НОВЫЙ ЛИД
     # =================================================
-
-    # Выбираем ответственного только для нового лида
     assignee = select_assignee(uf_crm_value, head_id or fallback_id, fallback_id)
     assigned_by_id = assignee['id']
     logging.info(
@@ -1417,8 +1572,8 @@ def tilda_webhook():
             "department_source": department_source,
         }
 
-        # db_save_assignment(new_lead_id, assigned_by_id, department_name,
-        #                    phone, is_working_hours())
+        db_save_assignment(new_lead_id, assigned_by_id, department_name,
+                           phone, is_working_hours())
 
         notify_assignee_new_lead(
             lead_id=new_lead_id, user_id=assigned_by_id,
@@ -1460,6 +1615,199 @@ def tilda_webhook():
             "department": department_name,
         }
         logging.error(f"[WEBHOOK] Ошибка создания лида: {error_data}")
+        return jsonify(error_data), 500
+
+
+# ============================================================
+# --- МАРШРУТ ДЛЯ DEBT-QUIZ ---
+# ============================================================
+
+@app.route('/webhook/debt-quiz', methods=['POST'])
+def debt_quiz_webhook():
+    """
+    Единая точка входа для debt-quiz.
+    Тип запроса определяется по:
+      1. Заголовку X-Action
+      2. Полю action в теле запроса
+    """
+    logging.info("=" * 60)
+    logging.info("[DEBT-QUIZ] Входящий запрос")
+
+    # Определяем action
+    action = request.headers.get('X-Action', '').strip().lower()
+
+    if request.is_json:
+        data = request.get_json() or {}
+    else:
+        data = request.form.to_dict()
+
+    # Если заголовок не задан — берём из тела
+    if not action:
+        action = str(data.get('action', 'lead')).strip().lower()
+
+    logging.info(f"[DEBT-QUIZ] action='{action}', данные: {data}")
+
+    # -------------------------------------------------------
+    # ЗАПРОС 2: Доотправка записи клиента
+    # -------------------------------------------------------
+    if action == 'booking_update':
+        return handle_booking_update(data)
+
+    # -------------------------------------------------------
+    # ЗАПРОС 1: Создание/обновление лида (action=lead или любой другой)
+    # -------------------------------------------------------
+    logging.info("[DEBT-QUIZ] Обрабатываем как создание лида.")
+
+    # Извлекаем поля из debt-quiz формата
+    external_id = data.get('external_id', '')
+    name = data.get('name', '')
+    phone_raw = data.get('phone', '')
+    region = data.get('region', '')
+    city = data.get('city', '')
+    debt_amount = data.get('debt_amount', '')
+    has_debt = data.get('has_debt', '')
+    utm_campaign = data.get('utm_campaign', '')
+
+    phone = normalize_phone(str(phone_raw))
+    if not phone:
+        logging.warning(f"[DEBT-QUIZ] Некорректный телефон: '{phone_raw}'")
+        return jsonify({"status": "ok", "message": "Invalid phone"}), 200
+
+    logging.info(f"[DEBT-QUIZ] Телефон: {phone}, region='{region}', city='{city}'")
+
+    # Определяем отдел по region/city
+    form_region = region or city
+    uf_crm_value, department_source = determine_department(
+        form_region, '', phone, rossvyaz_finder
+    )
+    department_name = "Екатеринбург" if uf_crm_value == UF_CRM_VALUE_EKATERINBURG else "Челябинск"
+    fallback_id = ASSIGNED_CHELYABINSK if uf_crm_value == UF_CRM_VALUE_CHELYABINSK else ASSIGNED_EKATERINBURG
+
+    # Проверяем дубль
+    duplicate_lead_id = get_duplicate_lead_id(phone)
+
+    # Руководитель
+    head_id = get_department_head(uf_crm_value)
+    logging.info(f"[DEBT-QUIZ] Руководитель '{department_name}': {head_id or 'не назначен'}")
+
+    # Собираем комментарий из полей квиза
+    comments_parts = []
+    if external_id:
+        comments_parts.append(f"ID квиза: {external_id}")
+    if debt_amount:
+        comments_parts.append(f"Сумма долга: {debt_amount}")
+    if has_debt is not None and has_debt != '':
+        has_debt_str = "Да" if str(has_debt).lower() in ('true', '1', 'yes') else "Нет"
+        comments_parts.append(f"Долг в ФССП: {has_debt_str}")
+    if region:
+        comments_parts.append(f"Регион: {region}")
+    if city:
+        comments_parts.append(f"Город: {city}")
+    if utm_campaign:
+        comments_parts.append(f"UTM кампания: {utm_campaign}")
+    comments = "\n".join(comments_parts)
+
+    # source_name для уведомлений
+    source_name = "Debt Quiz"
+
+    # =================================================
+    # ДУБЛИКАТ
+    # =================================================
+    if duplicate_lead_id:
+        logging.info(
+            f"[DEBT-QUIZ] Дубликат: лид #{duplicate_lead_id}, "
+            f"телефон {phone}. Отвечаем 200 немедленно."
+        )
+        threading.Thread(
+            target=_process_duplicate,
+            args=(duplicate_lead_id, phone, name, department_name,
+                  source_name, head_id),
+            daemon=True,
+            name=f"dup-dq-{duplicate_lead_id}"
+        ).start()
+
+        return jsonify({
+            "status": "ok",
+            "duplicate": True,
+            "lead_id": duplicate_lead_id,
+            "message": "Принято, дубликат"
+        }), 200
+
+    # =================================================
+    # НОВЫЙ ЛИД
+    # =================================================
+    assignee = select_assignee(uf_crm_value, head_id or fallback_id, fallback_id)
+    assigned_by_id = assignee['id']
+    logging.info(
+        f"[DEBT-QUIZ] Ответственный: ID={assigned_by_id} ({assignee['name']}). "
+        f"{assignee['reason']}"
+    )
+
+    title = f"Debt Quiz: {name}" if name else "Debt Quiz"
+
+    new_lead_id = create_lead(
+        title=title, name=name, phone=phone, email='',
+        comments=comments, uf_crm_value=uf_crm_value,
+        utm_campaign=utm_campaign,
+        source_id="WEB",
+        source_description=department_source,
+        assigned_by_id=assigned_by_id
+    )
+
+    if new_lead_id:
+        lead_url = get_lead_url(new_lead_id)
+        result_data = {
+            "status": "ok",
+            "action": "created",
+            "lead_id": new_lead_id,
+            "phone": phone,
+            "department": department_name,
+            "external_id": external_id,
+        }
+
+        db_save_assignment(new_lead_id, assigned_by_id, department_name,
+                           phone, is_working_hours())
+
+        notify_assignee_new_lead(
+            lead_id=new_lead_id, user_id=assigned_by_id,
+            user_name=assignee['name'], lead_name=title,
+            source_name=source_name, department_name=department_name,
+            phone=phone
+        )
+
+        start_lead_acceptance_monitor(
+            lead_id=new_lead_id, assigned_user_id=assigned_by_id,
+            assigned_user_name=assignee['name'],
+            head_id=head_id or fallback_id,
+            department_name=department_name,
+            lead_name=title, phone=phone
+        )
+
+        send_telegram_message(
+            f"<b>Новый лид (Debt Quiz)</b>\n\n"
+            f"Телефон: <code>{phone}</code>\n"
+            f"Имя: {name or '-'}\n"
+            f"Отдел: {department_name}\n"
+            f"Сумма долга: {debt_amount or '-'}\n"
+            f"ФССП: {has_debt or '-'}\n"
+            f"Ответственный: {assignee['name']} (ID={assigned_by_id})\n"
+            f"ID квиза: {external_id or '-'}\n"
+            f"ID лида: #{new_lead_id}\n"
+            f"Ссылка: {lead_url}"
+        )
+
+        logging.info(f"[DEBT-QUIZ] Готово: {result_data}")
+        return jsonify(result_data), 200
+
+    else:
+        error_data = {
+            "status": "error",
+            "action": "error",
+            "message": "Не удалось создать лид",
+            "phone": phone,
+            "department": department_name,
+        }
+        logging.error(f"[DEBT-QUIZ] Ошибка создания лида: {error_data}")
         return jsonify(error_data), 500
 
 
