@@ -1233,68 +1233,6 @@ def notify_assignee_new_lead(
     )
     logging.info(f"[NOTIFY] Новый лид {lead_id} → user {user_id} ({user_name})")
 
-
-# ============================================================
-# --- ФОНОВАЯ ОБРАБОТКА ДУБЛЯ ---
-# ============================================================
-
-def _process_duplicate(
-        duplicate_lead_id: int, phone: str, name: str,
-        department_name: str, source_name: str, head_id: int
-):
-    lead_url = get_lead_url(duplicate_lead_id)
-    details = get_lead_details(duplicate_lead_id)
-    current_status = details.get('STATUS_ID', '') if details else ''
-
-    status_updated = False
-    task_id = None
-    im_msg_id = None
-
-    if current_status == STATUS_CONVERTED:
-        logging.info(f"[DUP] Лид {duplicate_lead_id}: CONVERTED, статус не меняем.")
-        if head_id:
-            im_msg_id = send_im_message(
-                head_id,
-                f"ℹ️ Повторная заявка на конвертированный лид!\n\n"
-                f"Клиент снова оставил заявку, но лид уже конвертирован.\n"
-                f"Имя: {name or '-'}\n"
-                f"Отдел: {department_name}\n"
-                f"Ссылка: {lead_url}"
-            )
-    else:
-        status_updated = update_lead_status(duplicate_lead_id, STATUS_NEW)
-        if details and details.get("ASSIGNED_BY_ID"):
-            responsible_id = int(details["ASSIGNED_BY_ID"])
-            task_id = create_b24_task(duplicate_lead_id, responsible_id)
-            if head_id:
-                im_msg_id = send_im_message(
-                    head_id,
-                    f"🔔 Повторная заявка!\n\n"
-                    f"Клиент снова оставил заявку.\n"
-                    f"Имя: {name or '-'}\n"
-                    f"Отдел: {department_name}\n"
-                    f"Задача: {'#' + str(task_id) if task_id else 'ошибка'}\n"
-                    f"Ссылка: {lead_url}"
-                )
-
-    send_telegram_message(
-        f"<b>Повторная заявка</b>\n\n"
-        f"Телефон: <code>{phone}</code>\n"
-        f"Имя: {name or '-'}\nОтдел: {department_name}\n"
-        f"Источник: {source_name}\n"
-        f"Лид: #{duplicate_lead_id} | Статус: {current_status}\n"
-        f"→ NEW: {'✅' if status_updated else ('⏩ CONVERTED' if current_status == STATUS_CONVERTED else '❌')}\n"
-        f"Задача: {'#' + str(task_id) if task_id else ('—' if current_status == STATUS_CONVERTED else '❌')}\n"
-        f"Рук-ль уведомлён: {'✅' if im_msg_id else '❌'}\n"
-        f"Ссылка: {lead_url}"
-    )
-
-    logging.info(
-        f"[DUP] Фоновая обработка завершена: лид #{duplicate_lead_id}, "
-        f"status_updated={status_updated}, task_id={task_id}, im_msg_id={im_msg_id}"
-    )
-
-
 # ============================================================
 # --- ОБРАБОТЧИК BOOKING_UPDATE ---
 # ============================================================
@@ -1552,42 +1490,19 @@ def tilda_webhook():
     # Сначала проверяем дубль
     duplicate_lead_id = get_duplicate_lead_id(phone)
 
+    is_duplicate = bool(duplicate_lead_id)
+
+    if is_duplicate:
+        logging.info(
+            f"[WEBHOOK] Повторная заявка: найден старый лид #{duplicate_lead_id}, "
+            f"создаём новый."
+        )
+
     # Руководитель нужен в обоих случаях
     head_id = get_department_head(uf_crm_value)
     logging.info(f"[WEBHOOK] Руководитель '{department_name}': {head_id or 'не назначен'}")
 
     comments = build_comments(data)
-
-    # =================================================
-    # ДУБЛИКАТ
-    # =================================================
-    if duplicate_lead_id:
-        logging.info(
-            f"[DEBT-QUIZ] Дубликат: лид #{duplicate_lead_id}, "
-            f"телефон {phone}. Отвечаем 200 немедленно."
-        )
-        threading.Thread(
-            target=_process_duplicate,
-            args=(duplicate_lead_id, phone, name, department_name,
-                  source_name, head_id),
-            daemon=True,
-            name=f"dup-dq-{duplicate_lead_id}"
-        ).start()
-
-        # Берём ответственного из деталей лида
-        dup_details = get_lead_details(duplicate_lead_id)
-        dup_responsible_id = int(dup_details.get('ASSIGNED_BY_ID', 0)) if dup_details else 0
-        dup_responsible_info = get_responsible_phone_from_db(dup_responsible_id) if dup_responsible_id else {
-            'phone': None, 'name': None}
-
-        return jsonify({
-            "status": "ok",
-            "duplicate": True,
-            "lead_id": duplicate_lead_id,
-            "message": "Принято, дубликат",
-            "responsible_phone": dup_responsible_info['phone'],
-            "responsible_name": dup_responsible_info['name'],
-        }), 200
 
     # =================================================
     # НОВЫЙ ЛИД
@@ -1641,18 +1556,31 @@ def tilda_webhook():
             lead_name=title, phone=phone
         )
 
-        send_telegram_message(
-            f"<b>Новый Рекламный лид</b>\n\n"
-            f"Телефон: <code>{phone}</code>\n"
-            f"Имя: {name or '-'}\n"
-            f"Отдел: {department_name}\n"
-            f"Источник: {source_name}\n"
-            f"Ответственный: {assignee['name']} (ID={assigned_by_id})\n"
-            f"Распределение: {assignee['reason']}\n"
-            f"UTM: {utm_source or '-'}\n"
-            f"ID: #{new_lead_id}\n"
-            f"Ссылка: {lead_url}"
-        )
+        if is_duplicate:
+            send_telegram_message(
+                f"<b>Повторная заявка (создан новый лид)</b>\n\n"
+                f"Телефон: <code>{phone}</code>\n"
+                f"Имя: {name or '-'}\n"
+                f"Отдел: {department_name}\n"
+                f"Источник: {source_name}\n"
+                f"Старый лид: #{duplicate_lead_id}\n"
+                f"Новый лид: #{new_lead_id}\n"
+                f"Ответственный: {assignee['name']} (ID={assigned_by_id})\n"
+                f"Ссылка: {lead_url}"
+            )
+        else:
+            send_telegram_message(
+                f"<b>Новый Рекламный лид</b>\n\n"
+                f"Телефон: <code>{phone}</code>\n"
+                f"Имя: {name or '-'}\n"
+                f"Отдел: {department_name}\n"
+                f"Источник: {source_name}\n"
+                f"Ответственный: {assignee['name']} (ID={assigned_by_id})\n"
+                f"Распределение: {assignee['reason']}\n"
+                f"UTM: {utm_source or '-'}\n"
+                f"ID: #{new_lead_id}\n"
+                f"Ссылка: {lead_url}"
+            )
 
         logging.info(f"[WEBHOOK] Готово: {result_data}")
         return jsonify(result_data), 200
@@ -1736,6 +1664,13 @@ def debt_quiz_webhook():
 
     # Проверяем дубль
     duplicate_lead_id = get_duplicate_lead_id(phone)
+    is_duplicate = bool(duplicate_lead_id)
+
+    if is_duplicate:
+        logging.info(
+            f"[DEBT-QUIZ] Повторная заявка: найден старый лид #{duplicate_lead_id}, "
+            f"создаём новый."
+        )
 
     # Руководитель
     head_id = get_department_head(uf_crm_value)
@@ -1761,28 +1696,7 @@ def debt_quiz_webhook():
     # source_name для уведомлений
     source_name = "Debt Quiz"
 
-    # =================================================
-    # ДУБЛИКАТ
-    # =================================================
-    if duplicate_lead_id:
-        logging.info(
-            f"[DEBT-QUIZ] Дубликат: лид #{duplicate_lead_id}, "
-            f"телефон {phone}. Отвечаем 200 немедленно."
-        )
-        threading.Thread(
-            target=_process_duplicate,
-            args=(duplicate_lead_id, phone, name, department_name,
-                  source_name, head_id),
-            daemon=True,
-            name=f"dup-dq-{duplicate_lead_id}"
-        ).start()
 
-        return jsonify({
-            "status": "ok",
-            "duplicate": True,
-            "lead_id": duplicate_lead_id,
-            "message": "Принято, дубликат"
-        }), 200
 
     # =================================================
     # НОВЫЙ ЛИД
@@ -1834,18 +1748,31 @@ def debt_quiz_webhook():
             lead_name=title, phone=phone
         )
 
-        send_telegram_message(
-            f"<b>Новый лид (Debt Quiz)</b>\n\n"
-            f"Телефон: <code>{phone}</code>\n"
-            f"Имя: {name or '-'}\n"
-            f"Отдел: {department_name}\n"
-            f"Сумма долга: {debt_amount or '-'}\n"
-            f"ФССП: {has_debt or '-'}\n"
-            f"Ответственный: {assignee['name']} (ID={assigned_by_id})\n"
-            f"ID квиза: {external_id or '-'}\n"
-            f"ID лида: #{new_lead_id}\n"
-            f"Ссылка: {lead_url}"
-        )
+        if is_duplicate:
+            send_telegram_message(
+                f"<b>Повторная заявка (Debt Quiz)</b>\n\n"
+                f"Телефон: <code>{phone}</code>\n"
+                f"Имя: {name or '-'}\n"
+                f"Отдел: {department_name}\n"
+                f"Старый лид: #{duplicate_lead_id}\n"
+                f"Новый лид: #{new_lead_id}\n"
+                f"Ответственный: {assignee['name']} (ID={assigned_by_id})\n"
+                f"ID квиза: {external_id or '-'}\n"
+                f"Ссылка: {lead_url}"
+            )
+        else:
+            send_telegram_message(
+                f"<b>Новый лид (Debt Quiz)</b>\n\n"
+                f"Телефон: <code>{phone}</code>\n"
+                f"Имя: {name or '-'}\n"
+                f"Отдел: {department_name}\n"
+                f"Сумма долга: {debt_amount or '-'}\n"
+                f"ФССП: {has_debt or '-'}\n"
+                f"Ответственный: {assignee['name']} (ID={assigned_by_id})\n"
+                f"ID квиза: {external_id or '-'}\n"
+                f"ID лида: #{new_lead_id}\n"
+                f"Ссылка: {lead_url}"
+            )
 
         # Получаем телефон ответственного из БД
         responsible_info = get_responsible_phone_from_db(assigned_by_id)
@@ -1854,6 +1781,9 @@ def debt_quiz_webhook():
 
         logging.info(f"[DEBT-QUIZ] Готово: {result_data}")
         return jsonify(result_data), 200
+
+
+
 
     else:
         error_data = {
