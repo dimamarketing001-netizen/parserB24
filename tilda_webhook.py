@@ -194,7 +194,7 @@ EXCLUDED_COMMENT_FIELDS = {
     'Ваш телефон', 'ваш телефон',
     'Номер телефона', 'номер телефона',
     'contact_phone', 'inputPhone', 'ct_phone',
-    'dep_id', 'source_id',
+    'dep_id', 'source_id', 'type_id',
     'utm_source', 'UTM_SOURCE', 'utm_medium', 'UTM_MEDIUM',
     'utm_campaign', 'UTM_CAMPAIGN', 'utm_content', 'UTM_CONTENT',
     'utm_term', 'UTM_TERM', 'utm_region', 'utm_region_id', 'utm_yclid',
@@ -903,7 +903,8 @@ def create_lead(
         uf_crm_value: int, utm_source: str = "", utm_medium: str = "",
         utm_campaign: str = "", utm_content: str = "", utm_term: str = "",
         source_id: str = "WEB", source_description: str = "",
-        assigned_by_id: int = 1, status_id: str = "NEW", opened: str = "Y"
+        assigned_by_id: int = 1, status_id: str = "NEW", opened: str = "Y",
+        lead_type_id=None
 ):
     import time
 
@@ -915,6 +916,8 @@ def create_lead(
         "SOURCE_ID": source_id, "SOURCE_DESCRIPTION": source_description,
         "COMMENTS": comments, UF_CRM_FIELD: uf_crm_value,
     }
+    if lead_type_id is not None:
+        fields["UF_CRM_1790230122139"] = lead_type_id
     if utm_source:   fields["UTM_SOURCE"] = utm_source
     if utm_medium:   fields["UTM_MEDIUM"] = utm_medium
     if utm_campaign: fields["UTM_CAMPAIGN"] = utm_campaign
@@ -1345,7 +1348,7 @@ def _process_new_lead_background(
         utm_campaign, utm_content, utm_term,
         source_id, department_name,
         head_id, fallback_id,
-        is_duplicate=False, duplicate_lead_id=None
+        is_duplicate=False, duplicate_lead_id=None, lead_type_id=None
 ):
     logging.info("[BACKGROUND] Создание нового лида в фоне")
 
@@ -1356,7 +1359,7 @@ def _process_new_lead_background(
     )
     assigned_by_id = assignee['id']
 
-    title = f"Рекламный лид: {name}" if name else "Рекламный лид"
+    title = str(name).strip() or phone
 
     if is_duplicate:
         comments = (
@@ -1378,7 +1381,8 @@ def _process_new_lead_background(
         utm_term=utm_term,
         source_id=source_id,
         source_description=department_source,
-        assigned_by_id=assigned_by_id
+        assigned_by_id=assigned_by_id,
+        lead_type_id=lead_type_id
     )
 
     if not new_lead_id:
@@ -1456,6 +1460,14 @@ def tilda_webhook():
         return handle_booking_update(data)
 
     # Параметры из URL
+    raw_type_id = request.args.get('type_id', data.get('type_id', 70))
+    try:
+        lead_type_id = int(raw_type_id)
+        if lead_type_id <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "Invalid type_id"}), 400
+
     url_dep_id = request.args.get('dep_id')
     url_source_id = str(request.args.get('source_id', 'WEB')).strip()
     source_name = get_source_name(url_source_id)
@@ -1532,7 +1544,7 @@ def tilda_webhook():
                 utm_campaign, utm_content, utm_term,
                 url_source_id, department_name,
                 head_id, fallback_id,
-                True, duplicate_lead_id
+                True, duplicate_lead_id, lead_type_id
             ),
             daemon=True
         ).start()
@@ -1554,7 +1566,7 @@ def tilda_webhook():
         f"{assignee['reason']}"
     )
 
-    title = f"Рекламный лид: {name}" if name else "Рекламный лид"
+    title = str(name).strip() or phone
 
     new_lead_id = create_lead(
         title=title, name=name, phone=phone, email=email,
@@ -1563,7 +1575,8 @@ def tilda_webhook():
         utm_campaign=utm_campaign, utm_content=utm_content,
         utm_term=utm_term, source_id=url_source_id,
         source_description=department_source,
-        assigned_by_id=assigned_by_id
+        assigned_by_id=assigned_by_id,
+        lead_type_id=lead_type_id
     )
 
     if new_lead_id:
