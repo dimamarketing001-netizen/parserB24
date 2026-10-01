@@ -1405,7 +1405,7 @@ def _process_new_lead_background(
     )
     assigned_by_id = assignee['id']
 
-    title = str(name).strip() or phone
+    title = f"{get_lead_type_name(lead_type_id)} | {str(name).strip() or phone}"
 
     if is_duplicate:
         comments = (
@@ -1617,7 +1617,7 @@ def tilda_webhook():
         f"{assignee['reason']}"
     )
 
-    title = str(name).strip() or phone
+    title = f"{get_lead_type_name(lead_type_id)} | {str(name).strip() or phone}"
 
     new_lead_id = create_lead(
         title=title, name=name, phone=phone, email=email,
