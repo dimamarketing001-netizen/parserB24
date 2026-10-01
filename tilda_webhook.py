@@ -1,4 +1,5 @@
 import csv
+from html import escape
 import bisect
 import requests
 import json
@@ -709,15 +710,60 @@ def send_telegram_message(message: str):
             finally:
                 socket.getaddrinfo = old
 
-            resp.raise_for_status()
+            result = resp.json()
+            if not resp.ok or not result.get('ok'):
+                logging.error('[TG] Telegram отклонил сообщение: HTTP %s, %s',
+                              resp.status_code, result.get('description', 'без описания'))
+                if resp.status_code in (400, 401, 403):
+                    return
+                raise requests.exceptions.RequestException('Telegram response error')
             logging.info(f"[TG] Отправлено (попытка {attempt}/5).")
             return
         except requests.exceptions.RequestException as e:
-            logging.error(f"[TG] Ошибка (попытка {attempt}/5): {e}")
+            logging.error("[TG] Ошибка сети (попытка %s/5): %s", attempt, type(e).__name__)
             if attempt < 5:
                 time.sleep(3)
 
     logging.error("[TG] Все попытки исчерпаны.")
+
+
+
+def get_lead_type_name(lead_type_id):
+    """Название enum из Б24, без предположений о соответствии ID типам."""
+    if lead_type_id is None:
+        return 'Не указан'
+    try:
+        response = requests.get(webhook + 'crm.lead.fields', timeout=10)
+        response.raise_for_status()
+        field = response.json().get('result', {}).get('UF_CRM_1790230122139', {})
+        for item in field.get('items', []):
+            if str(item.get('ID', item.get('id'))) == str(lead_type_id):
+                return str(item.get('VALUE', item.get('value', lead_type_id)))
+        logging.warning('[TG] Тип лида %s не найден в справочнике Б24', lead_type_id)
+    except (requests.exceptions.RequestException, ValueError, AttributeError, TypeError):
+        logging.warning('[TG] Не удалось прочитать названия типов из Б24')
+    return 'ID ' + str(lead_type_id)
+
+
+def notify_telegram_lead(lead_id, phone, name, department_name, source_name,
+                         assignee, utm_source, lead_type_id, is_duplicate=False):
+    def safe(value):
+        return escape(str(value if value is not None else '-'))
+
+    heading = 'Новая повторная заявка' if is_duplicate else 'Новый лид'
+    send_telegram_message(
+        f'<b>{heading}</b>\n\n'
+        f'Тип лида: {safe(get_lead_type_name(lead_type_id))}\n'
+        f'Телефон: <code>{safe(phone)}</code>\n'
+        f'Имя: {safe(name or "-")}\n'
+        f'Отдел: {safe(department_name)}\n'
+        f'Источник: {safe(source_name)}\n'
+        f'Ответственный: {safe(assignee["name"])} (ID={safe(assignee["id"])})\n'
+        f'Распределение: {safe(assignee.get("reason", "-"))}\n'
+        f'UTM: {safe(utm_source or "-")}\n'
+        f'ID: #{safe(lead_id)}\n'
+        f'Ссылка: {safe(get_lead_url(lead_id))}'
+    )
 
 
 def get_duplicate_lead_id(phone: str):
@@ -1389,6 +1435,11 @@ def _process_new_lead_background(
         logging.error("[BACKGROUND] Не удалось создать новый лид")
         return
 
+    notify_telegram_lead(
+        new_lead_id, phone, name, department_name, get_source_name(source_id),
+        assignee, utm_source, lead_type_id, is_duplicate=is_duplicate
+    )
+
     notify_assignee_new_lead(
         lead_id=new_lead_id,
         user_id=assigned_by_id,
@@ -1591,6 +1642,11 @@ def tilda_webhook():
             "department_source": department_source,
         }
 
+        notify_telegram_lead(
+            new_lead_id, phone, name, department_name, source_name,
+            assignee, utm_source, lead_type_id
+        )
+
         db_save_assignment(new_lead_id, assigned_by_id, department_name,
                            phone, is_working_hours())
 
@@ -1607,19 +1663,6 @@ def tilda_webhook():
             head_id=head_id or fallback_id,
             department_name=department_name,
             lead_name=title, phone=phone
-        )
-
-        send_telegram_message(
-            f"<b>Новый Рекламный лид</b>\n\n"
-            f"Телефон: <code>{phone}</code>\n"
-            f"Имя: {name or '-'}\n"
-            f"Отдел: {department_name}\n"
-            f"Источник: {source_name}\n"
-            f"Ответственный: {assignee['name']} (ID={assigned_by_id})\n"
-            f"Распределение: {assignee['reason']}\n"
-            f"UTM: {utm_source or '-'}\n"
-            f"ID: #{new_lead_id}\n"
-            f"Ссылка: {lead_url}"
         )
 
         logging.info(f"[WEBHOOK] Готово: {result_data}")
