@@ -1,1 +1,5 @@
 .env
+# Persistent webhook request deduplication
+webhook_requests.sqlite3*
+__pycache__/
+*.log
