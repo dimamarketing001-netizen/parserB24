@@ -7,6 +7,10 @@ import logging
 import re
 import os
 import threading
+import hashlib
+import sqlite3
+import time
+from functools import wraps
 import mysql.connector
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify
@@ -686,6 +690,88 @@ def send_im_message(to_user_id: int, message: str):
         return None
 
 
+
+# Persistent request deduplication, shared by all workers on this server.
+# Keep this file across deployments; uncertain/in-flight requests never expire.
+IDEMPOTENCY_DB = os.getenv(
+    'WEBHOOK_IDEMPOTENCY_DB',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'webhook_requests.sqlite3')
+)
+
+def _request_identity(data):
+    scope = [request.path, request.args.get('dep_id', ''),
+             request.args.get('source_id', 'WEB'),
+             str(request.args.get('type_id', data.get('type_id', 70)))]
+    external = (request.headers.get('Idempotency-Key') or data.get('tranid')
+                or data.get('external_id') or data.get('request_id'))
+    if external:
+        payload = [scope, str(external)]
+        expires = None
+    else:
+        # Legacy clients: identical submissions within 10 minutes are one request.
+        ignored = {'COOKIES', 'cookies', 'token', 'timestamp'}
+        payload = [scope, {k: v for k, v in data.items() if k not in ignored},
+                   {k: v for k, v in request.args.items() if k != 'token'}]
+        expires = time.time() + 600
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(raw.encode()).hexdigest(), expires
+
+def deduplicate_submission(handler):
+    @wraps(handler)
+    def wrapped(*args, **kwargs):
+        data = (request.args.to_dict() if request.method == 'GET' else
+                request.get_json(silent=True) if request.is_json else request.form.to_dict())
+        if not isinstance(data, dict):
+            return jsonify({'status': 'error', 'message': 'Invalid request body'}), 400
+        action = request.headers.get('X-Action', data.get('action', '')).strip().lower()
+        if (action == 'booking_update' or is_tilda_test_request(data)
+                or (request.method == 'GET' and not request.args.get('ct_phone'))
+                or not normalize_phone(request.args.get('ct_phone', '') or extract_phone(data))):
+            return handler(*args, **kwargs)
+        key, expires = _request_identity(data)
+        try:
+            with sqlite3.connect(IDEMPOTENCY_DB, timeout=10) as db:
+                db.execute('CREATE TABLE IF NOT EXISTS submissions '
+                           '(key TEXT PRIMARY KEY, state TEXT, response TEXT, code INTEGER, expires REAL)')
+                db.execute('BEGIN IMMEDIATE')
+                row = db.execute('SELECT state, response, code, expires FROM submissions WHERE key=?', (key,)).fetchone()
+                if row and row[0] == 'done' and row[3] is not None and row[3] < time.time():
+                    db.execute('DELETE FROM submissions WHERE key=?', (key,))
+                    row = None
+                if row:
+                    logging.info('[IDEMPOTENCY] Replay %s (%s)', key[:12], row[0])
+                    if row[1]:
+                        return jsonify(json.loads(row[1])), row[2]
+                    return jsonify({'status': 'ok', 'action': 'processing',
+                                    'message': 'Already accepted; do not create another lead'}), 202
+                db.execute('INSERT INTO submissions VALUES (?, ?, NULL, NULL, ?)',
+                           (key, 'processing', expires))
+        except sqlite3.Error:
+            logging.exception('[IDEMPOTENCY] Storage unavailable; creation blocked')
+            return jsonify({'status': 'error', 'message': 'Request storage unavailable'}), 503
+        # On crashes/errors leave the reservation in place: CRM may have committed.
+        response = app.make_response(handler(*args, **kwargs))
+        body = response.get_json(silent=True)
+        if response.status_code < 400 and body is not None:
+            with sqlite3.connect(IDEMPOTENCY_DB, timeout=10) as db:
+                db.execute('UPDATE submissions SET state=?, response=?, code=? WHERE key=?',
+                           ('done', json.dumps(body, ensure_ascii=False), response.status_code, key))
+        return response
+    return wrapped
+
+
+def background_notification(handler):
+    @wraps(handler)
+    def wrapped(*args, **kwargs):
+        def run():
+            try:
+                handler(*args, **kwargs)
+            except Exception:
+                logging.exception('[NOTIFICATION] Background notification failed')
+        threading.Thread(target=run, daemon=True).start()
+    return wrapped
+
+@background_notification
 def send_telegram_message(message: str):
     import time
     import socket
@@ -1007,10 +1093,12 @@ def create_lead(
 
         except requests.exceptions.RequestException as e:
             last_error = str(e)
-            logging.error(f"[CREATE] Ошибка запроса (попытка {attempt}): {e}")
+            logging.error("[CREATE] Outcome uncertain (%s); automatic retry stopped", type(e).__name__)
+            break
         except json.JSONDecodeError as e:
             last_error = str(e)
-            logging.error(f"[CREATE] Ошибка JSON (попытка {attempt}): {e}")
+            logging.error("[CREATE] Invalid CRM response; automatic retry stopped")
+            break
 
         if attempt < 10:
             time.sleep(3)
@@ -1020,7 +1108,7 @@ def create_lead(
         f"🚨 <b>ОШИБКА: Не удалось создать лид в CRM</b>\n\n"
         f"Телефон: <code>{phone}</code>\n"
         f"Имя: {name or '-'}\nОтдел: {dept_name}\n"
-        f"SOURCE_ID: {source_id}\nПопыток: 10\n"
+        f"SOURCE_ID: {source_id}\nПопыток: {attempt}\n"
         f"Ошибка: {last_error}\n\nЛид нужно создать вручную!"
     )
     return None
@@ -1482,6 +1570,7 @@ def health_check():
 
 
 @app.route('/webhook/tilda', methods=['GET', 'POST'])
+@deduplicate_submission
 def tilda_webhook():
     logging.info("=" * 60)
     logging.info("[WEBHOOK] Входящий запрос")
@@ -1685,6 +1774,7 @@ def tilda_webhook():
 # ============================================================
 
 @app.route('/webhook/debt-quiz', methods=['POST'])
+@deduplicate_submission
 def debt_quiz_webhook():
     """
     Единая точка входа для debt-quiz.
